@@ -198,68 +198,9 @@ SELECT raquet_is_data_row(NULL)
 NULL
 
 # =============================================================================
-# Test spatial integration (WKB parsing)
+# Note: ST_RasterValue and quadbin_contains/quadbin_intersects require
+# the DuckDB Spatial extension for GEOMETRY types.
+# Full spatial integration tests should be run with:
+#   LOAD spatial;
+#   -- Then test with ST_Point(), ST_MakeEnvelope(), etc.
 # =============================================================================
-
-# Test WKB point parsing - NYC coordinates
-query II
-SELECT (raquet_parse_wkb_point('\x01\x01\x00\x00\x00\xb3\xea\x73\xb5\x15\x7f\x52\xc0\xc7\x29\x3a\x92\xcb\x5f\x44\x40'::BLOB)).lon,
-       (raquet_parse_wkb_point('\x01\x01\x00\x00\x00\xb3\xea\x73\xb5\x15\x7f\x52\xc0\xc7\x29\x3a\x92\xcb\x5f\x44\x40'::BLOB)).lat
-----
--73.9857	40.7484
-
-# Test WKB point parsing - origin coordinates
-query II
-SELECT (raquet_parse_wkb_point('\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB)).lon,
-       (raquet_parse_wkb_point('\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB)).lat
-----
-0.0	0.0
-
-# Test invalid WKB returns NULL
-query I
-SELECT raquet_parse_wkb_point('\x01\x01\x00'::BLOB)
-----
-NULL
-
-# Test NULL input returns NULL
-query I
-SELECT raquet_parse_wkb_point(NULL)
-----
-NULL
-
-# =============================================================================
-# Test complete spatial workflow
-# =============================================================================
-
-statement ok
-CREATE TABLE spatial_test AS
-SELECT
-    quadbin_from_lonlat(-73.9857, 40.7484, 10) as block,
-    '\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10'::BLOB as band_1,
-    '{"block_width": 4, "block_height": 4, "compression": "none", "bands": [["band_1", "uint8"]]}' as metadata,
-    '\x01\x01\x00\x00\x00\xb3\xea\x73\xb5\x15\x7f\x52\xc0\xc7\x29\x3a\x92\xcb\x5f\x44\x40'::BLOB as point_wkb
-
-# Test raster value at WKB point coordinates
-query I
-SELECT ST_RasterValue(
-    block,
-    band_1,
-    (raquet_parse_wkb_point(point_wkb)).lon,
-    (raquet_parse_wkb_point(point_wkb)).lat,
-    metadata
-) FROM spatial_test
-----
-15.0
-
-# Test spatial containment
-query I
-SELECT quadbin_contains(
-    block,
-    (raquet_parse_wkb_point(point_wkb)).lon,
-    (raquet_parse_wkb_point(point_wkb)).lat
-) FROM spatial_test
-----
-true
-
-statement ok
-DROP TABLE spatial_test

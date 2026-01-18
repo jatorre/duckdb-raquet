@@ -7,8 +7,151 @@
 #include <sstream>
 #include <iomanip>
 #include <vector>
+#include <cstring>
 
 namespace duckdb {
+
+// ============================================================================
+// Geometry helpers - extract coordinates from GEOMETRY (WKB) type
+// ============================================================================
+
+// Extract X and Y from a GEOMETRY POINT value
+// Returns true on success, false if not a valid point
+static bool ExtractPointCoordinates(const string_t &geom, double &x, double &y) {
+    const uint8_t *data = reinterpret_cast<const uint8_t*>(geom.GetData());
+    idx_t size = geom.GetSize();
+
+    if (size < 21) return false;
+
+    uint8_t byte_order = data[0];
+    bool little_endian = (byte_order == 1);
+
+    uint32_t geom_type;
+    if (little_endian) {
+        memcpy(&geom_type, data + 1, 4);
+    } else {
+        geom_type = (static_cast<uint32_t>(data[1]) << 24) |
+                    (static_cast<uint32_t>(data[2]) << 16) |
+                    (static_cast<uint32_t>(data[3]) << 8) |
+                    static_cast<uint32_t>(data[4]);
+    }
+
+    uint32_t base_type = geom_type & 0xFF;
+    if (base_type != 1) return false;
+
+    idx_t coord_offset = 5;
+    if (geom_type & 0x20000000) {
+        coord_offset += 4;
+        if (size < coord_offset + 16) return false;
+    }
+
+    if (little_endian) {
+        memcpy(&x, data + coord_offset, 8);
+        memcpy(&y, data + coord_offset + 8, 8);
+    } else {
+        uint64_t x_bits, y_bits;
+        for (int i = 0; i < 8; i++) {
+            reinterpret_cast<uint8_t*>(&x_bits)[7-i] = data[coord_offset + i];
+            reinterpret_cast<uint8_t*>(&y_bits)[7-i] = data[coord_offset + 8 + i];
+        }
+        memcpy(&x, &x_bits, 8);
+        memcpy(&y, &y_bits, 8);
+    }
+
+    return true;
+}
+
+// Extract bounding box from a GEOMETRY value (works for POINT, POLYGON, etc.)
+// For POINT, min=max
+static bool ExtractBoundingBox(const string_t &geom, double &min_x, double &min_y, double &max_x, double &max_y) {
+    const uint8_t *data = reinterpret_cast<const uint8_t*>(geom.GetData());
+    idx_t size = geom.GetSize();
+
+    if (size < 21) return false;
+
+    uint8_t byte_order = data[0];
+    bool little_endian = (byte_order == 1);
+
+    uint32_t geom_type;
+    if (little_endian) {
+        memcpy(&geom_type, data + 1, 4);
+    } else {
+        geom_type = (static_cast<uint32_t>(data[1]) << 24) |
+                    (static_cast<uint32_t>(data[2]) << 16) |
+                    (static_cast<uint32_t>(data[3]) << 8) |
+                    static_cast<uint32_t>(data[4]);
+    }
+
+    uint32_t base_type = geom_type & 0xFF;
+    idx_t offset = 5;
+
+    // Handle SRID prefix
+    if (geom_type & 0x20000000) {
+        offset += 4;
+    }
+
+    if (base_type == 1) {  // POINT
+        double x, y;
+        if (!ExtractPointCoordinates(geom, x, y)) return false;
+        min_x = max_x = x;
+        min_y = max_y = y;
+        return true;
+    } else if (base_type == 3) {  // POLYGON
+        // Read number of rings
+        if (size < offset + 4) return false;
+        uint32_t num_rings;
+        if (little_endian) {
+            memcpy(&num_rings, data + offset, 4);
+        } else {
+            num_rings = (static_cast<uint32_t>(data[offset]) << 24) |
+                       (static_cast<uint32_t>(data[offset+1]) << 16) |
+                       (static_cast<uint32_t>(data[offset+2]) << 8) |
+                       static_cast<uint32_t>(data[offset+3]);
+        }
+        offset += 4;
+
+        if (num_rings == 0) return false;
+
+        // Read number of points in first ring
+        if (size < offset + 4) return false;
+        uint32_t num_points;
+        if (little_endian) {
+            memcpy(&num_points, data + offset, 4);
+        } else {
+            num_points = (static_cast<uint32_t>(data[offset]) << 24) |
+                        (static_cast<uint32_t>(data[offset+1]) << 16) |
+                        (static_cast<uint32_t>(data[offset+2]) << 8) |
+                        static_cast<uint32_t>(data[offset+3]);
+        }
+        offset += 4;
+
+        if (num_points == 0 || size < offset + num_points * 16) return false;
+
+        // Initialize with first point
+        if (little_endian) {
+            memcpy(&min_x, data + offset, 8);
+            memcpy(&min_y, data + offset + 8, 8);
+        } else {
+            return false; // Simplified: skip big endian for polygon
+        }
+        max_x = min_x;
+        max_y = min_y;
+
+        // Find bbox of all points
+        for (uint32_t i = 1; i < num_points; i++) {
+            double x, y;
+            memcpy(&x, data + offset + i * 16, 8);
+            memcpy(&y, data + offset + i * 16 + 8, 8);
+            if (x < min_x) min_x = x;
+            if (x > max_x) max_x = x;
+            if (y < min_y) min_y = y;
+            if (y > max_y) max_y = y;
+        }
+        return true;
+    }
+
+    return false;
+}
 
 // quadbin_from_tile(x, y, z) -> UBIGINT
 static void QuadbinFromTileFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -164,51 +307,60 @@ static void QuadbinPixelXYFunction(DataChunk &args, ExpressionState &state, Vect
 // Spatial Filtering Functions
 // ============================================================================
 
-// quadbin_contains(cell, lon, lat) -> BOOLEAN
-// Check if a point (lon, lat) falls within the tile represented by cell
+// quadbin_contains(cell, point_geometry) -> BOOLEAN
+// Check if a point geometry falls within the tile represented by cell
+// Requires DuckDB Spatial extension for GEOMETRY type
 static void QuadbinContainsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    auto &cell_vec = args.data[0];
-    auto &lon_vec = args.data[1];
-    auto &lat_vec = args.data[2];
-
-    TernaryExecutor::Execute<uint64_t, double, double, bool>(
-        cell_vec, lon_vec, lat_vec, result, args.size(),
-        [](uint64_t cell, double lon, double lat) {
-            // Get the tile coordinates from the cell
-            int tile_x, tile_y, z;
-            quadbin::cell_to_tile(cell, tile_x, tile_y, z);
-
-            // Get the tile coordinates for the point at the same resolution
-            int point_tile_x, point_tile_y;
-            quadbin::lonlat_to_tile(lon, lat, z, point_tile_x, point_tile_y);
-
-            // Point is in tile if tile coordinates match
-            return (tile_x == point_tile_x && tile_y == point_tile_y);
-        });
-}
-
-// quadbin_intersects_bbox(cell, min_lon, min_lat, max_lon, max_lat) -> BOOLEAN
-// Check if a tile intersects a bounding box
-static void QuadbinIntersectsBboxFunction(DataChunk &args, ExpressionState &state, Vector &result) {
     args.data[0].Flatten(args.size());
     args.data[1].Flatten(args.size());
-    args.data[2].Flatten(args.size());
-    args.data[3].Flatten(args.size());
-    args.data[4].Flatten(args.size());
 
     auto cell_data = FlatVector::GetData<uint64_t>(args.data[0]);
-    auto min_lon_data = FlatVector::GetData<double>(args.data[1]);
-    auto min_lat_data = FlatVector::GetData<double>(args.data[2]);
-    auto max_lon_data = FlatVector::GetData<double>(args.data[3]);
-    auto max_lat_data = FlatVector::GetData<double>(args.data[4]);
+    auto geom_data = FlatVector::GetData<string_t>(args.data[1]);
     auto result_data = FlatVector::GetData<bool>(result);
+    auto &result_mask = FlatVector::Validity(result);
 
     for (idx_t i = 0; i < args.size(); i++) {
         auto cell = cell_data[i];
-        auto query_min_lon = min_lon_data[i];
-        auto query_min_lat = min_lat_data[i];
-        auto query_max_lon = max_lon_data[i];
-        auto query_max_lat = max_lat_data[i];
+        auto geom = geom_data[i];
+
+        double lon, lat;
+        if (!ExtractPointCoordinates(geom, lon, lat)) {
+            throw InvalidInputException("quadbin_contains: geometry must be a POINT");
+        }
+
+        // Get the tile coordinates from the cell
+        int tile_x, tile_y, z;
+        quadbin::cell_to_tile(cell, tile_x, tile_y, z);
+
+        // Get the tile coordinates for the point at the same resolution
+        int point_tile_x, point_tile_y;
+        quadbin::lonlat_to_tile(lon, lat, z, point_tile_x, point_tile_y);
+
+        // Point is in tile if tile coordinates match
+        result_data[i] = (tile_x == point_tile_x && tile_y == point_tile_y);
+    }
+}
+
+// quadbin_intersects(cell, geometry) -> BOOLEAN
+// Check if a tile intersects a geometry (uses bounding box of geometry)
+// Requires DuckDB Spatial extension for GEOMETRY type
+static void QuadbinIntersectsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    args.data[0].Flatten(args.size());
+    args.data[1].Flatten(args.size());
+
+    auto cell_data = FlatVector::GetData<uint64_t>(args.data[0]);
+    auto geom_data = FlatVector::GetData<string_t>(args.data[1]);
+    auto result_data = FlatVector::GetData<bool>(result);
+    auto &result_mask = FlatVector::Validity(result);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        auto cell = cell_data[i];
+        auto geom = geom_data[i];
+
+        double query_min_lon, query_min_lat, query_max_lon, query_max_lat;
+        if (!ExtractBoundingBox(geom, query_min_lon, query_min_lat, query_max_lon, query_max_lat)) {
+            throw InvalidInputException("quadbin_intersects: could not extract bounding box from geometry");
+        }
 
         // Get tile bbox
         int tile_x, tile_y, z;
@@ -225,20 +377,6 @@ static void QuadbinIntersectsBboxFunction(DataChunk &args, ExpressionState &stat
 
         result_data[i] = intersects;
     }
-}
-
-// quadbin_cell_for_point(lon, lat, resolution) -> UBIGINT
-// Alias for quadbin_from_lonlat - for clarity in spatial queries
-static void QuadbinCellForPointFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    auto &lon_vec = args.data[0];
-    auto &lat_vec = args.data[1];
-    auto &res_vec = args.data[2];
-
-    TernaryExecutor::Execute<double, double, int32_t, uint64_t>(
-        lon_vec, lat_vec, res_vec, result, args.size(),
-        [](double lon, double lat, int32_t resolution) {
-            return quadbin::lonlat_to_cell(lon, lat, resolution);
-        });
 }
 
 // ============================================================================
@@ -554,30 +692,22 @@ void RegisterQuadbinFunctions(ExtensionLoader &loader) {
     loader.RegisterFunction(pixel_xy);
 
     // ========================================================================
-    // Spatial Filtering Functions
+    // Spatial Filtering Functions (require DuckDB Spatial extension)
     // ========================================================================
 
-    // quadbin_contains(cell, lon, lat) -> BOOLEAN
+    // quadbin_contains(cell, point_geometry) -> BOOLEAN
     ScalarFunction contains("quadbin_contains",
-        {LogicalType::UBIGINT, LogicalType::DOUBLE, LogicalType::DOUBLE},
+        {LogicalType::UBIGINT, LogicalType::GEOMETRY()},
         LogicalType::BOOLEAN,
         QuadbinContainsFunction);
     loader.RegisterFunction(contains);
 
-    // quadbin_intersects_bbox(cell, min_lon, min_lat, max_lon, max_lat) -> BOOLEAN
-    ScalarFunction intersects_bbox("quadbin_intersects_bbox",
-        {LogicalType::UBIGINT, LogicalType::DOUBLE, LogicalType::DOUBLE,
-         LogicalType::DOUBLE, LogicalType::DOUBLE},
+    // quadbin_intersects(cell, geometry) -> BOOLEAN
+    ScalarFunction intersects("quadbin_intersects",
+        {LogicalType::UBIGINT, LogicalType::GEOMETRY()},
         LogicalType::BOOLEAN,
-        QuadbinIntersectsBboxFunction);
-    loader.RegisterFunction(intersects_bbox);
-
-    // quadbin_cell_for_point(lon, lat, resolution) -> UBIGINT (alias for quadbin_from_lonlat)
-    ScalarFunction cell_for_point("quadbin_cell_for_point",
-        {LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::INTEGER},
-        LogicalType::UBIGINT,
-        QuadbinCellForPointFunction);
-    loader.RegisterFunction(cell_for_point);
+        QuadbinIntersectsFunction);
+    loader.RegisterFunction(intersects);
 
     // ========================================================================
     // Spatial Format Functions (DuckDB Spatial compatibility)
