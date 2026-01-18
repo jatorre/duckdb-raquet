@@ -1,6 +1,9 @@
 #include "band_decoder.hpp"
 #include <zlib.h>
 #include <stdexcept>
+#include <cstring>
+#include <vector>
+#include <string>
 
 namespace duckdb {
 namespace raquet {
@@ -10,53 +13,77 @@ std::vector<uint8_t> decompress_gzip(const uint8_t *data, size_t size) {
         return {};
     }
 
-    // Initialize zlib for gzip decompression
-    z_stream stream = {};
-    stream.zalloc = Z_NULL;
-    stream.zfree = Z_NULL;
-    stream.opaque = Z_NULL;
-    stream.avail_in = static_cast<uInt>(size);
-    stream.next_in = const_cast<Bytef*>(data);
-
-    // 15 + 16 for gzip format, 15 + 32 for auto-detect gzip/zlib
-    int init_ret = inflateInit2(&stream, 15 + 32);
-    if (init_ret != Z_OK) {
-        throw std::runtime_error("Failed to initialize zlib for decompression");
+    if (data == nullptr) {
+        throw std::runtime_error("Null data pointer for decompression");
     }
 
-    std::vector<uint8_t> result;
-    result.reserve(size * 4);  // Initial estimate
+    // For gzip: estimate decompressed size (typical ratio 10:1 to 100:1)
+    // A 256x256 uint8 tile = 65536 bytes
+    size_t estimated_size = 256 * 256;  // Default tile size
+    if (size > 100) {
+        estimated_size = size * 50;  // Conservative estimate
+    }
 
-    uint8_t buffer[32768];
-    int ret;
-    size_t max_iterations = (size * 100) / sizeof(buffer) + 100;  // Safety limit
-    size_t iterations = 0;
+    std::vector<uint8_t> result(estimated_size);
 
-    do {
-        stream.avail_out = sizeof(buffer);
-        stream.next_out = buffer;
+    // Copy input to ensure it's contiguous
+    std::vector<uint8_t> input(data, data + size);
 
-        ret = inflate(&stream, Z_NO_FLUSH);
+    z_stream strm;
+    memset(&strm, 0, sizeof(strm));
+    strm.next_in = input.data();
+    strm.avail_in = static_cast<uInt>(input.size());
+    strm.next_out = result.data();
+    strm.avail_out = static_cast<uInt>(result.size());
 
-        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR || ret == Z_NEED_DICT) {
-            inflateEnd(&stream);
-            throw std::runtime_error("Zlib decompression error: " + std::to_string(ret));
+    // 15 + 16 = gzip decoding only
+    int ret = inflateInit2(&strm, 15 + 16);
+    if (ret != Z_OK) {
+        throw std::runtime_error("inflateInit2 failed: " + std::to_string(ret));
+    }
+
+    ret = inflate(&strm, Z_FINISH);
+
+    if (ret == Z_BUF_ERROR && strm.avail_out == 0) {
+        // Need more output space - resize and retry
+        inflateEnd(&strm);
+
+        result.resize(result.size() * 4);
+        std::vector<uint8_t> input2(data, data + size);
+
+        z_stream strm2;
+        memset(&strm2, 0, sizeof(strm2));
+        strm2.next_in = input2.data();
+        strm2.avail_in = static_cast<uInt>(input2.size());
+        strm2.next_out = result.data();
+        strm2.avail_out = static_cast<uInt>(result.size());
+
+        ret = inflateInit2(&strm2, 15 + 16);
+        if (ret != Z_OK) {
+            throw std::runtime_error("inflateInit2 retry failed");
         }
 
-        size_t have = sizeof(buffer) - stream.avail_out;
-        if (have > 0) {
-            result.insert(result.end(), buffer, buffer + have);
+        ret = inflate(&strm2, Z_FINISH);
+        size_t decompressed_size = result.size() - strm2.avail_out;
+        inflateEnd(&strm2);
+
+        if (ret != Z_STREAM_END) {
+            throw std::runtime_error("inflate retry failed: " + std::to_string(ret));
         }
 
-        iterations++;
-        if (iterations > max_iterations) {
-            inflateEnd(&stream);
-            throw std::runtime_error("Decompression exceeded maximum iterations");
-        }
+        result.resize(decompressed_size);
+        return result;
+    }
 
-    } while (ret != Z_STREAM_END && stream.avail_in > 0);
+    if (ret != Z_STREAM_END) {
+        inflateEnd(&strm);
+        throw std::runtime_error("inflate failed: " + std::to_string(ret));
+    }
 
-    inflateEnd(&stream);
+    size_t decompressed_size = result.size() - strm.avail_out;
+    inflateEnd(&strm);
+
+    result.resize(decompressed_size);
     return result;
 }
 

@@ -25,6 +25,7 @@ static void RaquetPixelFunction(DataChunk &args, ExpressionState &state, Vector 
     auto width_data = FlatVector::GetData<int32_t>(args.data[4]);
     auto compression_data = FlatVector::GetData<string_t>(args.data[5]);
     auto result_data = FlatVector::GetData<double>(result);
+    auto &result_mask = FlatVector::Validity(result);
 
     for (idx_t i = 0; i < args.size(); i++) {
         auto band = band_data[i];
@@ -36,10 +37,23 @@ static void RaquetPixelFunction(DataChunk &args, ExpressionState &state, Vector 
 
         bool compressed = (compression == "gzip");
 
+        const char* band_ptr = band.GetData();
+        idx_t band_size = band.GetSize();
+
+        // Return NULL for empty/invalid band data
+        if (band_ptr == nullptr || band_size == 0) {
+            result_mask.SetInvalid(i);
+            continue;
+        }
+        if (x < 0 || y < 0 || width <= 0) {
+            result_mask.SetInvalid(i);
+            continue;
+        }
+
         try {
             result_data[i] = raquet::decode_pixel(
-                reinterpret_cast<const uint8_t*>(band.GetData()),
-                band.GetSize(),
+                reinterpret_cast<const uint8_t*>(band_ptr),
+                static_cast<size_t>(band_size),
                 dtype, x, y, width, compressed
             );
         } catch (const std::exception &e) {
@@ -51,21 +65,22 @@ static void RaquetPixelFunction(DataChunk &args, ExpressionState &state, Vector 
 // ST_RasterValue(block UBIGINT, band BLOB, lon DOUBLE, lat DOUBLE, dtype VARCHAR, width INT, compression VARCHAR) -> DOUBLE
 // Get pixel value at lon/lat from a raquet tile
 static void STRasterValueFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    auto &block_vec = args.data[0];
-    auto &band_vec = args.data[1];
-    auto &lon_vec = args.data[2];
-    auto &lat_vec = args.data[3];
-    auto &dtype_vec = args.data[4];
-    auto &width_vec = args.data[5];
-    auto &compression_vec = args.data[6];
+    // Flatten all vectors to ensure consistent access
+    args.data[0].Flatten(args.size());
+    args.data[1].Flatten(args.size());
+    args.data[2].Flatten(args.size());
+    args.data[3].Flatten(args.size());
+    args.data[4].Flatten(args.size());
+    args.data[5].Flatten(args.size());
+    args.data[6].Flatten(args.size());
 
-    auto block_data = FlatVector::GetData<uint64_t>(block_vec);
-    auto band_data = FlatVector::GetData<string_t>(band_vec);
-    auto lon_data = FlatVector::GetData<double>(lon_vec);
-    auto lat_data = FlatVector::GetData<double>(lat_vec);
-    auto dtype_data = FlatVector::GetData<string_t>(dtype_vec);
-    auto width_data = FlatVector::GetData<int32_t>(width_vec);
-    auto compression_data = FlatVector::GetData<string_t>(compression_vec);
+    auto block_data = FlatVector::GetData<uint64_t>(args.data[0]);
+    auto band_data = FlatVector::GetData<string_t>(args.data[1]);
+    auto lon_data = FlatVector::GetData<double>(args.data[2]);
+    auto lat_data = FlatVector::GetData<double>(args.data[3]);
+    auto dtype_data = FlatVector::GetData<string_t>(args.data[4]);
+    auto width_data = FlatVector::GetData<int32_t>(args.data[5]);
+    auto compression_data = FlatVector::GetData<string_t>(args.data[6]);
     auto result_data = FlatVector::GetData<double>(result);
     auto &result_mask = FlatVector::Validity(result);
 
@@ -96,6 +111,12 @@ static void STRasterValueFunction(DataChunk &args, ExpressionState &state, Vecto
             continue;
         }
 
+        // Check for empty band data
+        if (band.GetSize() == 0) {
+            result_mask.SetInvalid(i);
+            continue;
+        }
+
         bool compressed = (compression == "gzip");
 
         result_data[i] = raquet::decode_pixel(
@@ -109,17 +130,18 @@ static void STRasterValueFunction(DataChunk &args, ExpressionState &state, Vecto
 // raquet_decode_band(band BLOB, dtype VARCHAR, width INT, height INT, compression VARCHAR) -> DOUBLE[]
 // Decode entire band to array of doubles
 static void RaquetDecodeBandFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    auto &band_vec = args.data[0];
-    auto &dtype_vec = args.data[1];
-    auto &width_vec = args.data[2];
-    auto &height_vec = args.data[3];
-    auto &compression_vec = args.data[4];
+    // Flatten all vectors to ensure consistent access
+    args.data[0].Flatten(args.size());
+    args.data[1].Flatten(args.size());
+    args.data[2].Flatten(args.size());
+    args.data[3].Flatten(args.size());
+    args.data[4].Flatten(args.size());
 
-    auto band_data = FlatVector::GetData<string_t>(band_vec);
-    auto dtype_data = FlatVector::GetData<string_t>(dtype_vec);
-    auto width_data = FlatVector::GetData<int32_t>(width_vec);
-    auto height_data = FlatVector::GetData<int32_t>(height_vec);
-    auto compression_data = FlatVector::GetData<string_t>(compression_vec);
+    auto band_data = FlatVector::GetData<string_t>(args.data[0]);
+    auto dtype_data = FlatVector::GetData<string_t>(args.data[1]);
+    auto width_data = FlatVector::GetData<int32_t>(args.data[2]);
+    auto height_data = FlatVector::GetData<int32_t>(args.data[3]);
+    auto compression_data = FlatVector::GetData<string_t>(args.data[4]);
 
     auto list_data = ListVector::GetData(result);
     auto &list_child = ListVector::GetEntry(result);
