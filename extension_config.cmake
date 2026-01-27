@@ -6,14 +6,14 @@ duckdb_extension_load(raquet
     LOAD_TESTS
 )
 
+# Include parquet (required for read_parquet)
+duckdb_extension_load(parquet)
+
 # Include httpfs for remote file access
 duckdb_extension_load(httpfs
     GIT_URL https://github.com/duckdb/duckdb-httpfs
     GIT_TAG add35a03c1adfe530bb4ef69133b94fe8ec8ea35
 )
 
-# Include iceberg for lakehouse integration (iceberg_scan + raquet)
-duckdb_extension_load(iceberg
-    GIT_URL https://github.com/duckdb/duckdb-iceberg
-    GIT_TAG main
-)
+# Note: iceberg extension can be loaded separately by users who need lakehouse integration
+# It requires additional dependencies (avro with libavro-c)
