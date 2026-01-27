@@ -337,8 +337,8 @@ struct RaquetMetadata {
     std::string compression;
     int block_width;
     int block_height;
-    int min_resolution;
-    int max_resolution;
+    int min_zoom;       // v0.3.0: was min_resolution
+    int max_zoom;       // v0.3.0: was max_resolution
     std::vector<std::pair<std::string, std::string>> bands;
 
     static RaquetMetadata Parse(const std::string &json_str) {
@@ -346,8 +346,8 @@ struct RaquetMetadata {
         meta.compression = "none";
         meta.block_width = 256;
         meta.block_height = 256;
-        meta.min_resolution = 0;
-        meta.max_resolution = 26;
+        meta.min_zoom = 0;
+        meta.max_zoom = 26;
 
         yyjson_doc *doc = yyjson_read(json_str.c_str(), json_str.length(), 0);
         if (!doc) {
@@ -365,35 +365,40 @@ struct RaquetMetadata {
             meta.compression = yyjson_get_str(compression_val);
         }
 
-        yyjson_val *width_val = yyjson_obj_get(root, "block_width");
-        if (width_val && yyjson_is_int(width_val)) {
-            meta.block_width = yyjson_get_int(width_val);
+        // v0.3.0: Parse tiling object
+        yyjson_val *tiling_val = yyjson_obj_get(root, "tiling");
+        if (tiling_val && yyjson_is_obj(tiling_val)) {
+            yyjson_val *width_val = yyjson_obj_get(tiling_val, "block_width");
+            if (width_val && yyjson_is_int(width_val)) {
+                meta.block_width = yyjson_get_int(width_val);
+            }
+
+            yyjson_val *height_val = yyjson_obj_get(tiling_val, "block_height");
+            if (height_val && yyjson_is_int(height_val)) {
+                meta.block_height = yyjson_get_int(height_val);
+            }
+
+            yyjson_val *minzoom_val = yyjson_obj_get(tiling_val, "min_zoom");
+            if (minzoom_val && yyjson_is_int(minzoom_val)) {
+                meta.min_zoom = yyjson_get_int(minzoom_val);
+            }
+
+            yyjson_val *maxzoom_val = yyjson_obj_get(tiling_val, "max_zoom");
+            if (maxzoom_val && yyjson_is_int(maxzoom_val)) {
+                meta.max_zoom = yyjson_get_int(maxzoom_val);
+            }
         }
 
-        yyjson_val *height_val = yyjson_obj_get(root, "block_height");
-        if (height_val && yyjson_is_int(height_val)) {
-            meta.block_height = yyjson_get_int(height_val);
-        }
-
-        yyjson_val *minres_val = yyjson_obj_get(root, "minresolution");
-        if (minres_val && yyjson_is_int(minres_val)) {
-            meta.min_resolution = yyjson_get_int(minres_val);
-        }
-
-        yyjson_val *maxres_val = yyjson_obj_get(root, "maxresolution");
-        if (maxres_val && yyjson_is_int(maxres_val)) {
-            meta.max_resolution = yyjson_get_int(maxres_val);
-        }
-
+        // v0.3.0: bands are objects with name and type fields
         yyjson_val *bands_val = yyjson_obj_get(root, "bands");
         if (bands_val && yyjson_is_arr(bands_val)) {
             size_t idx, max;
             yyjson_val *band;
             yyjson_arr_foreach(bands_val, idx, max, band) {
-                if (yyjson_is_arr(band) && yyjson_arr_size(band) >= 2) {
-                    yyjson_val *name_val = yyjson_arr_get(band, 0);
-                    yyjson_val *dtype_val = yyjson_arr_get(band, 1);
-                    if (yyjson_is_str(name_val) && yyjson_is_str(dtype_val)) {
+                if (yyjson_is_obj(band)) {
+                    yyjson_val *name_val = yyjson_obj_get(band, "name");
+                    yyjson_val *dtype_val = yyjson_obj_get(band, "type");
+                    if (name_val && dtype_val && yyjson_is_str(name_val) && yyjson_is_str(dtype_val)) {
                         meta.bands.emplace_back(yyjson_get_str(name_val), yyjson_get_str(dtype_val));
                     }
                 }
@@ -637,7 +642,7 @@ static void RegionStatsUpdate(Vector inputs[], AggregateInputData &aggr_input_da
             auto meta = RaquetMetadata::Parse(metadata_data[i].GetString());
             // Default: use max resolution (no filtering, -1 = all resolutions pass through,
             // but we actually want only max resolution for backward compatibility)
-            int target_res = meta.max_resolution;
+            int target_res = meta.max_zoom;
             ProcessTileForRegionStats(state, band_data[i], block_data[i], region_data[i], meta, false, 0.0, target_res);
         } catch (...) {
             // Skip tiles with errors
@@ -677,7 +682,7 @@ static void RegionStatsUpdateNodata(Vector inputs[], AggregateInputData &aggr_in
 
         try {
             auto meta = RaquetMetadata::Parse(metadata_data[i].GetString());
-            int target_res = meta.max_resolution;
+            int target_res = meta.max_zoom;
             ProcessTileForRegionStats(state, band_data[i], block_data[i], region_data[i], meta, has_nodata, nodata, target_res);
         } catch (...) {
             continue;
@@ -688,19 +693,19 @@ static void RegionStatsUpdateNodata(Vector inputs[], AggregateInputData &aggr_in
 // Helper to compute target resolution from string and geometry
 static int ComputeTargetResolution(const std::string &resolution_str, const string_t &region,
                                     const RaquetMetadata &meta) {
-    auto config = ParseResolution(resolution_str, meta.max_resolution);
+    auto config = ParseResolution(resolution_str, meta.max_zoom);
 
     if (config.mode == ResolutionMode::MAX) {
-        return meta.max_resolution;
+        return meta.max_zoom;
     } else if (config.mode == ResolutionMode::EXPLICIT) {
         return config.explicit_level;
     } else {  // AUTO
         double min_lon, min_lat, max_lon, max_lat;
         if (!ExtractGeometryBBox(region, min_lon, min_lat, max_lon, max_lat)) {
-            return meta.max_resolution;  // Fallback
+            return meta.max_zoom;  // Fallback
         }
         return EstimateAutoResolution(min_lon, min_lat, max_lon, max_lat,
-                                       meta.min_resolution, meta.max_resolution);
+                                       meta.min_zoom, meta.max_zoom);
     }
 }
 

@@ -274,25 +274,30 @@ struct ClipMetadata {
             meta.compression = yyjson_get_str(compression_val);
         }
 
-        yyjson_val *width_val = yyjson_obj_get(root, "block_width");
-        if (width_val && yyjson_is_int(width_val)) {
-            meta.block_width = yyjson_get_int(width_val);
+        // v0.3.0: Parse tiling object
+        yyjson_val *tiling_val = yyjson_obj_get(root, "tiling");
+        if (tiling_val && yyjson_is_obj(tiling_val)) {
+            yyjson_val *width_val = yyjson_obj_get(tiling_val, "block_width");
+            if (width_val && yyjson_is_int(width_val)) {
+                meta.block_width = yyjson_get_int(width_val);
+            }
+
+            yyjson_val *height_val = yyjson_obj_get(tiling_val, "block_height");
+            if (height_val && yyjson_is_int(height_val)) {
+                meta.block_height = yyjson_get_int(height_val);
+            }
         }
 
-        yyjson_val *height_val = yyjson_obj_get(root, "block_height");
-        if (height_val && yyjson_is_int(height_val)) {
-            meta.block_height = yyjson_get_int(height_val);
-        }
-
+        // v0.3.0: bands are objects with name and type fields
         yyjson_val *bands_val = yyjson_obj_get(root, "bands");
         if (bands_val && yyjson_is_arr(bands_val)) {
             size_t idx, max;
             yyjson_val *band;
             yyjson_arr_foreach(bands_val, idx, max, band) {
-                if (yyjson_is_arr(band) && yyjson_arr_size(band) >= 2) {
-                    yyjson_val *name_val = yyjson_arr_get(band, 0);
-                    yyjson_val *dtype_val = yyjson_arr_get(band, 1);
-                    if (yyjson_is_str(name_val) && yyjson_is_str(dtype_val)) {
+                if (yyjson_is_obj(band)) {
+                    yyjson_val *name_val = yyjson_obj_get(band, "name");
+                    yyjson_val *dtype_val = yyjson_obj_get(band, "type");
+                    if (name_val && dtype_val && yyjson_is_str(name_val) && yyjson_is_str(dtype_val)) {
                         meta.bands.emplace_back(yyjson_get_str(name_val), yyjson_get_str(dtype_val));
                     }
                 }

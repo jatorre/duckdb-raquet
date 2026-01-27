@@ -40,8 +40,8 @@ static void RaquetParseMetadataFunction(DataChunk &args, ExpressionState &state,
     auto &compression_vec = *struct_entries[0];
     auto &block_width_vec = *struct_entries[1];
     auto &block_height_vec = *struct_entries[2];
-    auto &minresolution_vec = *struct_entries[3];
-    auto &maxresolution_vec = *struct_entries[4];
+    auto &min_zoom_vec = *struct_entries[3];
+    auto &max_zoom_vec = *struct_entries[4];
     auto &num_bands_vec = *struct_entries[5];
 
     for (idx_t i = 0; i < args.size(); i++) {
@@ -58,8 +58,8 @@ static void RaquetParseMetadataFunction(DataChunk &args, ExpressionState &state,
             FlatVector::GetData<string_t>(compression_vec)[i] = StringVector::AddString(compression_vec, meta.compression);
             FlatVector::GetData<int32_t>(block_width_vec)[i] = meta.block_width;
             FlatVector::GetData<int32_t>(block_height_vec)[i] = meta.block_height;
-            FlatVector::GetData<int32_t>(minresolution_vec)[i] = meta.minresolution;
-            FlatVector::GetData<int32_t>(maxresolution_vec)[i] = meta.maxresolution;
+            FlatVector::GetData<int32_t>(min_zoom_vec)[i] = meta.min_zoom;
+            FlatVector::GetData<int32_t>(max_zoom_vec)[i] = meta.max_zoom;
             FlatVector::GetData<int32_t>(num_bands_vec)[i] = static_cast<int32_t>(meta.bands.size());
         } catch (...) {
             result_mask.SetInvalid(i);
@@ -166,13 +166,13 @@ void RegisterRaquetTableFunctions(ExtensionLoader &loader) {
     // Scalar helper functions
     // =========================================================================
 
-    // raquet_parse_metadata(metadata) -> STRUCT
+    // raquet_parse_metadata(metadata) -> STRUCT (v0.3.0 format)
     child_list_t<LogicalType> meta_struct;
     meta_struct.push_back(make_pair("compression", LogicalType::VARCHAR));
     meta_struct.push_back(make_pair("block_width", LogicalType::INTEGER));
     meta_struct.push_back(make_pair("block_height", LogicalType::INTEGER));
-    meta_struct.push_back(make_pair("minresolution", LogicalType::INTEGER));
-    meta_struct.push_back(make_pair("maxresolution", LogicalType::INTEGER));
+    meta_struct.push_back(make_pair("min_zoom", LogicalType::INTEGER));
+    meta_struct.push_back(make_pair("max_zoom", LogicalType::INTEGER));
     meta_struct.push_back(make_pair("num_bands", LogicalType::INTEGER));
 
     ScalarFunction parse_metadata_fn("raquet_parse_metadata",

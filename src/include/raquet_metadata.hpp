@@ -7,15 +7,17 @@
 namespace duckdb {
 namespace raquet {
 
-// Parsed raquet metadata
+// Parsed raquet metadata (v0.3.0 format)
 struct RaquetMetadata {
     std::string compression;
-    int width;
-    int height;
     int block_width;
     int block_height;
-    int minresolution;
-    int maxresolution;
+    int min_zoom;       // was minresolution
+    int max_zoom;       // was maxresolution
+    int pixel_zoom;     // new in v0.3.0
+    int num_blocks;
+    std::string scheme; // "quadbin"
+    std::string crs;    // "EPSG:3857"
     std::vector<std::pair<std::string, std::string>> bands;  // name -> type
 
     // Get band type by index (0-based) or name
@@ -83,6 +85,33 @@ inline int extract_json_int(const std::string &json, const std::string &key, int
     }
 }
 
+// Extract a nested JSON object as a string
+inline std::string extract_json_object(const std::string &json, const std::string &key) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.length();
+
+    // Skip whitespace
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n')) {
+        pos++;
+    }
+
+    if (pos >= json.size() || json[pos] != '{') return "";
+
+    // Find matching closing brace
+    int depth = 1;
+    size_t start = pos;
+    pos++;
+    while (pos < json.size() && depth > 0) {
+        if (json[pos] == '{') depth++;
+        else if (json[pos] == '}') depth--;
+        pos++;
+    }
+
+    return json.substr(start, pos - start);
+}
+
 // Parse bands array from metadata JSON
 inline std::vector<std::pair<std::string, std::string>> parse_bands(const std::string &json) {
     std::vector<std::pair<std::string, std::string>> bands;
@@ -123,19 +152,35 @@ inline std::vector<std::pair<std::string, std::string>> parse_bands(const std::s
     return bands;
 }
 
-// Parse metadata JSON string
+// Parse metadata JSON string (v0.3.0 format)
 inline RaquetMetadata parse_metadata(const std::string &json) {
     RaquetMetadata meta;
 
     meta.compression = extract_json_string(json, "compression");
     if (meta.compression.empty()) meta.compression = "none";
 
-    meta.width = extract_json_int(json, "width", 256);
-    meta.height = extract_json_int(json, "height", 256);
-    meta.block_width = extract_json_int(json, "block_width", 256);
-    meta.block_height = extract_json_int(json, "block_height", 256);
-    meta.minresolution = extract_json_int(json, "minresolution", 0);
-    meta.maxresolution = extract_json_int(json, "maxresolution", 26);
+    meta.crs = extract_json_string(json, "crs");
+
+    // Parse tiling object (v0.3.0)
+    std::string tiling = extract_json_object(json, "tiling");
+    if (!tiling.empty()) {
+        meta.min_zoom = extract_json_int(tiling, "min_zoom", 0);
+        meta.max_zoom = extract_json_int(tiling, "max_zoom", 26);
+        meta.pixel_zoom = extract_json_int(tiling, "pixel_zoom", 0);
+        meta.num_blocks = extract_json_int(tiling, "num_blocks", 0);
+        meta.block_width = extract_json_int(tiling, "block_width", 256);
+        meta.block_height = extract_json_int(tiling, "block_height", 256);
+        meta.scheme = extract_json_string(tiling, "scheme");
+    } else {
+        // Defaults if no tiling object
+        meta.min_zoom = 0;
+        meta.max_zoom = 26;
+        meta.pixel_zoom = 0;
+        meta.num_blocks = 0;
+        meta.block_width = 256;
+        meta.block_height = 256;
+        meta.scheme = "quadbin";
+    }
 
     meta.bands = parse_bands(json);
 
