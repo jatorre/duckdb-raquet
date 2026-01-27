@@ -22,6 +22,8 @@ This extension enables DuckDB to query Raquet files directly using SQL, with fun
 - **Band Decoding** - Decompress and read binary raster data
 - **Spatial Filtering** - Point-in-tile and bbox intersection tests
 - **PostGIS-like Spatial Predicates** - `ST_Intersects`, `ST_Contains` for raster-vector operations
+- **Time-Series Support** - CF conventions for temporal rasters (NetCDF compatible)
+- **Cloud-Native** - Query remote Parquet files on S3/GCS with predicate pushdown
 - **DuckDB Spatial Integration** - Works with GEOMETRY types from DuckDB Spatial
 
 ## Installation
@@ -474,15 +476,95 @@ FROM raster_data;
 -- Supported operations: 'add', 'subtract', 'multiply', 'divide', 'ndiff'
 ```
 
+### Time-Series Raster Queries
+
+Raquet supports time-series rasters using the CF (Climate and Forecast) conventions, primarily for NetCDF data with temporal dimensions.
+
+```sql
+LOAD raquet;
+
+-- Query time-series data structure (CFSR Sea Surface Temperature example)
+SELECT
+    COUNT(*) as total_rows,
+    COUNT(DISTINCT block) as unique_tiles,
+    MIN(time_ts) as earliest,
+    MAX(time_ts) as latest
+FROM read_parquet('cfsr_sst.parquet')
+WHERE block != 0;
+-- Result: 1296 rows, 3 tiles, 1980-01-01 to 2015-12-01
+
+-- Filter by year using the derived timestamp (easy SQL)
+SELECT
+    block,
+    time_ts,
+    (ST_RasterSummaryStats(band_1, 'float64', 256, 256, 'gzip', -999000000.0)).mean as sst_mean
+FROM read_parquet('cfsr_sst.parquet')
+WHERE block != 0
+  AND YEAR(time_ts) = 2010
+ORDER BY time_ts
+LIMIT 5;
+
+-- Filter by date range
+SELECT *
+FROM read_parquet('cfsr_sst.parquet')
+WHERE block != 0
+  AND time_ts >= '2000-01-01' AND time_ts < '2010-01-01';
+
+-- Calculate annual averages for climate analysis
+SELECT
+    YEAR(time_ts) as year,
+    AVG((ST_RasterSummaryStats(band_1, 'float64', 256, 256, 'gzip', -999000000.0)).mean) as annual_sst
+FROM read_parquet('cfsr_sst.parquet')
+WHERE block = 5192650370358181887  -- specific tile
+GROUP BY YEAR(time_ts)
+ORDER BY year;
+
+-- Use CF time value directly (for NetCDF compatibility)
+-- CF units: "minutes since 1980-01-01 00:00"
+SELECT time_cf, time_ts
+FROM read_parquet('cfsr_sst.parquet')
+WHERE block != 0 AND time_cf < 100000;  -- First ~2 months
+```
+
+**Why dual time columns?**
+
+| Column | Purpose | Use Case |
+|--------|---------|----------|
+| `time_cf` | Authoritative CF value | NetCDF round-trip fidelity, scientific reproducibility |
+| `time_ts` | Derived timestamp | Easy SQL filtering, Parquet predicate pushdown |
+
+The `time_ts` column enables efficient queries like `WHERE YEAR(time_ts) = 2010` without needing to understand the CF epoch and units. For non-Gregorian calendars (360_day, noleap), `time_ts` will be NULL and you must use `time_cf`.
+
 ## Raquet File Format
 
 A Raquet file is a Parquet file with specific conventions:
+
+### Standard Raster Schema
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `block` | `UBIGINT` | QUADBIN cell ID (0 for metadata row) |
 | `band_1`, `band_2`, ... | `BLOB` | Compressed pixel data |
 | `metadata` | `VARCHAR` | JSON metadata (only in row where block=0) |
+
+### Time-Series Raster Schema
+
+For rasters with temporal dimensions (e.g., NetCDF files), two additional columns are added:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block` | `UBIGINT` | QUADBIN cell ID (0 for metadata row) |
+| `metadata` | `VARCHAR` | JSON metadata |
+| `time_cf` | `DOUBLE` | **Authoritative** CF numeric time value (e.g., minutes since reference) |
+| `time_ts` | `TIMESTAMP` | **Derived** timestamp for convenience queries (nullable for non-Gregorian calendars) |
+| `band_1` | `BLOB` | Compressed pixel data |
+
+**Key points:**
+- `time_cf` is authoritative - preserves exact CF convention values for NetCDF round-trip fidelity
+- `time_ts` is derived - enables easy SQL queries with Parquet predicate pushdown
+- `time_ts` may be NULL for non-Gregorian calendars (360_day, noleap, etc.)
+- Each row represents one tile at one time step
+- Rows are sorted by `(block, time_cf)` for efficient filtering
 
 **Metadata JSON Structure:**
 ```json
@@ -497,6 +579,23 @@ A Raquet file is a Parquet file with specific conventions:
   ]
 }
 ```
+
+**Time-Series Metadata (additional fields):**
+```json
+{
+  "time": {
+    "cf:units": "minutes since 1980-01-01 00:00",
+    "cf:calendar": "standard",
+    "interpretation": "period_start",
+    "count": 432,
+    "range": [0.0, 18889920.0]
+  }
+}
+```
+
+The `interpretation` field indicates how timestamps should be understood:
+- `period_start` - timestamp marks the beginning of the period (e.g., Jan 1 for yearly data)
+- `instant` - timestamp marks the exact acquisition time
 
 ## Coordinate System and Projections
 
@@ -574,6 +673,13 @@ CARTO provides sample Raquet files for testing:
 | `riyadh.parquet` | Satellite imagery of Riyadh (3 bands, uint16) | 809 MB | [Download](https://storage.googleapis.com/bq_ee_exports/raquet-test/riyadh.parquet) |
 | `naip_test.parquet` | NAIP aerial imagery, NY area (3 bands, uint8) | 380 MB | [Download](https://storage.googleapis.com/bq_ee_exports/raquet-test/naip_test.parquet) |
 | `europe.parquet` | European coverage | - | [Download](https://storage.googleapis.com/bq_ee_exports/raquet-test/europe.parquet) |
+| `TCI.parquet` | Sentinel-2 True Color (3 bands, uint8) | 261 MB | [Download](https://storage.googleapis.com/sdsc_demo25/TCI.parquet) |
+
+**Time-Series Sample Data:**
+
+| File | Description | Time Range | Tiles × Time Steps |
+|------|-------------|------------|-------------------|
+| `cfsr_sst.parquet` | CFSR Sea Surface Temperature (monthly) | 1980-2015 | 3 × 432 = 1,296 rows |
 
 **Quick test with sample data:**
 
@@ -614,9 +720,12 @@ WHERE block = quadbin_from_lonlat(-73.22, 40.91, 18);
 - [x] `ST_Clip()` / `ST_ClipMask()` - Clip rasters to geometry boundaries
 - [x] `ST_NDVI()` / `ST_NormalizedDifference()` - Vegetation and spectral indices
 - [x] `ST_BandMath()` - Generic band arithmetic operations
+- [x] Time-series support with CF conventions (NetCDF compatible)
+- [x] Cloud-native access via httpfs (S3/GCS/HTTP)
 
 **Planned:**
 - [ ] `read_raquet()` - Dedicated table function with automatic metadata handling
+- [ ] Time-aware filtering in `read_raquet()` macro
 - [ ] Performance optimizations for batch pixel extraction
 - [ ] Streaming support for large raster files
 - [ ] `ST_Resample()` - Change raster resolution (nearest-neighbor)
