@@ -198,10 +198,23 @@ true
 
 # =============================================================================
 # Test spatial filtering functions
-# Note: quadbin_contains and quadbin_intersects require GEOMETRY type
-# which needs the DuckDB Spatial extension to be loaded.
+# Note: quadbin_contains, quadbin_intersects, ST_Intersects, and ST_Contains
+# require GEOMETRY type which needs the DuckDB Spatial extension to be loaded.
+#
 # Full spatial filtering tests should be run with:
 #   LOAD spatial;
+#
+#   -- Low-level quadbin functions:
 #   SELECT quadbin_contains(cell, ST_Point(-73.9857, 40.7484));
 #   SELECT quadbin_intersects(cell, ST_MakeEnvelope(-74.0, 40.7, -73.9, 40.8));
+#
+#   -- PostGIS-like API (recommended for users):
+#   SELECT ST_Intersects(block, ST_GeomFromText('POLYGON((-74 40.7, -73.9 40.7, -73.9 40.8, -74 40.8, -74 40.7))'));
+#   SELECT ST_Contains(ST_GeomFromText('POLYGON((-80 35, -70 35, -70 45, -80 45, -80 35))'), block);
+#
+# Example usage with raquet files:
+#   SELECT ST_RegionStats(band_1, block, region_geom, metadata) as stats
+#   FROM read_raquet('dem.raquet'),
+#        (SELECT ST_GeomFromText('POLYGON(...)') as region_geom)
+#   WHERE ST_Intersects(block, region_geom);
 # =============================================================================

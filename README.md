@@ -17,8 +17,11 @@ This extension enables DuckDB to query Raquet files directly using SQL, with fun
 - **QUADBIN Functions** - Convert between tiles, cells, and geographic coordinates
 - **Raster Value Extraction** - PostGIS-style `ST_RasterValue` for pixel lookups
 - **Summary Statistics** - Calculate min/max/mean/stddev for raster tiles
+- **Region Statistics** - Aggregate raster statistics within arbitrary polygon regions
+- **Polygon Fill** - Fill polygons with QUADBIN cells at any resolution
 - **Band Decoding** - Decompress and read binary raster data
 - **Spatial Filtering** - Point-in-tile and bbox intersection tests
+- **PostGIS-like Spatial Predicates** - `ST_Intersects`, `ST_Contains` for raster-vector operations
 - **DuckDB Spatial Integration** - Works with GEOMETRY types from DuckDB Spatial
 
 ## Installation
@@ -104,6 +107,8 @@ WHERE block = quadbin_from_lonlat(-73.9857, 40.7484, 13);
 |----------|-------------|-------------|
 | `quadbin_contains(cell, lon, lat)` | Check if point is within tile | `BOOLEAN` |
 | `quadbin_intersects_bbox(cell, min_lon, min_lat, max_lon, max_lat)` | Check if tile intersects bbox | `BOOLEAN` |
+| `ST_Intersects(block, geometry)` | Check if tile intersects geometry bbox | `BOOLEAN` |
+| `ST_Contains(geometry, block)` | Check if geometry fully contains tile | `BOOLEAN` |
 
 ### Hierarchical Functions
 
@@ -115,6 +120,8 @@ WHERE block = quadbin_from_lonlat(-73.9857, 40.7484, 13);
 | `quadbin_to_children(cell, resolution)` | Get all children at specified resolution | `LIST(UBIGINT)` |
 | `quadbin_sibling(cell)` | Get sibling cells (same parent) | `LIST(UBIGINT)` |
 | `quadbin_kring(cell, k)` | Get cells within k distance | `LIST(UBIGINT)` |
+| `quadbin_polyfill(geometry, resolution)` | Fill polygon with cells (center mode) | `LIST(UBIGINT)` |
+| `quadbin_polyfill(geometry, resolution, mode)` | Fill polygon with cells (mode: 'center', 'intersects', 'contains') | `LIST(UBIGINT)` |
 
 ### Spatial Format Functions
 
@@ -123,6 +130,7 @@ WHERE block = quadbin_from_lonlat(-73.9857, 40.7484, 13);
 | `quadbin_to_wkt(cell)` | Convert cell to WKT POLYGON | `VARCHAR` |
 | `quadbin_to_geojson(cell)` | Convert cell to GeoJSON | `VARCHAR` |
 | `quadbin_boundary(cell)` | Alias for quadbin_to_wkt | `VARCHAR` |
+| `ST_GeomFromQuadbin(cell)` | Convert cell to GEOMETRY polygon | `GEOMETRY` |
 
 ### Raster Functions
 
@@ -137,6 +145,8 @@ WHERE block = quadbin_from_lonlat(-73.9857, 40.7484, 13);
 | `raquet_decode_band(band, dtype, width, height, compression)` | Decode entire band | `DOUBLE[]` |
 | `ST_RasterSummaryStats(band, dtype, w, h, compression)` | Get tile statistics | `STRUCT(...)` |
 | `ST_RasterSummaryStats(band, dtype, w, h, compression, nodata)` | Stats with nodata filter | `STRUCT(...)` |
+| `ST_RegionStats(band, block, region, metadata)` | Aggregate stats for pixels within geometry | `STRUCT(...)` |
+| `ST_RegionStats(band, block, region, metadata, nodata)` | Region stats with nodata filter | `STRUCT(...)` |
 
 ### Metadata Functions
 
@@ -298,6 +308,14 @@ FROM dem
 WHERE block != 0
 LIMIT 5;
 
+-- Or use the native GEOMETRY conversion
+SELECT
+    block,
+    ST_GeomFromQuadbin(block) AS geom
+FROM dem
+WHERE block != 0
+LIMIT 5;
+
 -- Get elevation using GEOMETRY point
 SELECT ST_RasterValue(
     r.block,
@@ -307,6 +325,84 @@ SELECT ST_RasterValue(
 ) AS elevation
 FROM dem r
 WHERE block = quadbin_from_lonlat(-73.9857, 40.7484, 13);
+```
+
+### Polygon Fill (Polyfill)
+
+```sql
+LOAD spatial;
+LOAD raquet;
+
+-- Fill a polygon with QUADBIN cells at resolution 10
+SELECT unnest(quadbin_polyfill(
+    ST_GeomFromText('POLYGON((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.9, -74.1 40.6))'),
+    10
+)) AS cell;
+
+-- Fill with different modes:
+-- 'center' (default): cells whose center is inside the polygon
+-- 'intersects': cells that intersect the polygon (complete coverage)
+-- 'contains': cells fully contained within the polygon (conservative)
+SELECT unnest(quadbin_polyfill(
+    ST_GeomFromText('POLYGON((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.9, -74.1 40.6))'),
+    10,
+    'intersects'
+)) AS cell;
+```
+
+### Region Statistics
+
+```sql
+LOAD spatial;
+LOAD raquet;
+
+-- Get aggregate statistics for pixels within a polygon region
+-- First, get the metadata
+WITH meta AS (
+    SELECT metadata FROM read_parquet('dem.parquet') WHERE block = 0
+)
+SELECT (ST_RegionStats(
+    band_1,
+    block,
+    ST_GeomFromText('POLYGON((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.9, -74.1 40.6))'),
+    (SELECT metadata FROM meta)
+)).*
+FROM read_parquet('dem.parquet')
+WHERE block != 0
+  AND ST_Intersects(block, ST_GeomFromText('POLYGON((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.9, -74.1 40.6))'));
+-- Returns: count, sum, mean, min, max, stddev
+
+-- With nodata filtering
+SELECT (ST_RegionStats(
+    band_1,
+    block,
+    region_geom,
+    metadata,
+    -9999.0  -- nodata value to exclude
+)).*
+FROM raster_data;
+```
+
+### PostGIS-like Spatial Predicates
+
+```sql
+LOAD spatial;
+LOAD raquet;
+
+-- Find tiles that intersect a polygon (fast bbox check)
+SELECT block
+FROM dem
+WHERE ST_Intersects(block, ST_GeomFromText('POLYGON((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.9, -74.1 40.6))'))
+  AND block != 0;
+
+-- Find tiles fully contained within a polygon
+SELECT block
+FROM dem
+WHERE ST_Contains(
+    ST_GeomFromText('POLYGON((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.9, -74.1 40.6))'),
+    block
+)
+  AND block != 0;
 ```
 
 ## Raquet File Format
@@ -401,9 +497,12 @@ WHERE block = quadbin_from_lonlat(-73.22, 40.91, 18);
 - [x] `quadbin_to_children()` - Get child cells at higher resolution
 - [x] `quadbin_kring()` - Get neighboring cells
 - [x] `quadbin_sibling()` - Get sibling cells
+- [x] `quadbin_polyfill()` - Fill polygon with QUADBIN cells
+- [x] `ST_RegionStats()` - Aggregate raster statistics within polygon regions
+- [x] `ST_Intersects()` / `ST_Contains()` - PostGIS-like spatial predicates
+- [x] `ST_GeomFromQuadbin()` - Convert QUADBIN cell to GEOMETRY
 
 **Planned:**
-- [ ] `quadbin_polyfill()` - Fill polygon with cells
 - [ ] `read_raquet()` - Dedicated table function with automatic metadata handling
 - [ ] Performance optimizations for batch pixel extraction
 - [ ] Streaming support for large raster files

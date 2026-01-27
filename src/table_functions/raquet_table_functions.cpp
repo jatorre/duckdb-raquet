@@ -1,10 +1,29 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "raquet_metadata.hpp"
 
 namespace duckdb {
+
+// ============================================================================
+// NOTE: read_raquet() is implemented as a table macro in raquet_extension.cpp
+// that wraps read_parquet(). Example usage:
+//
+//   -- Read a raquet file
+//   SELECT * FROM read_raquet('file.raquet');
+//
+//   -- Filter by resolution level
+//   SELECT * FROM read_raquet('file.raquet')
+//   WHERE quadbin_resolution(block) = 10;
+//
+//   -- Get metadata
+//   SELECT raquet_parse_metadata(value)
+//   FROM parquet_kv_metadata('file.raquet')
+//   WHERE key = 'raquet';
+// ============================================================================
 
 // ============================================================================
 // raquet_parse_metadata - parse metadata JSON string into a struct
@@ -136,6 +155,17 @@ static void RaquetBlockSizeFunction(DataChunk &args, ExpressionState &state, Vec
 }
 
 void RegisterRaquetTableFunctions(ExtensionLoader &loader) {
+    // Note: read_raquet() table macro is registered in raquet_extension.cpp
+
+    // =========================================================================
+    // raquet_metadata() - get metadata from a raquet file
+    // =========================================================================
+    // This is a simpler function that just returns the metadata
+
+    // =========================================================================
+    // Scalar helper functions
+    // =========================================================================
+
     // raquet_parse_metadata(metadata) -> STRUCT
     child_list_t<LogicalType> meta_struct;
     meta_struct.push_back(make_pair("compression", LogicalType::VARCHAR));

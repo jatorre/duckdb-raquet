@@ -15,12 +15,15 @@ set(EXTENSION_STATIC_BUILD 1)
 
 include_directories(src/include)
 
+
 set(EXTENSION_SOURCES
     src/raquet_extension.cpp
     src/quadbin/quadbin_functions.cpp
+    src/quadbin/quadbin_polyfill.cpp
     src/raster/band_decoder.cpp
     src/raster/st_raster_value.cpp
     src/raster/st_raster_stats.cpp
+    src/raster/st_region_stats.cpp
     src/metadata/raquet_metadata.cpp
     src/table_functions/raquet_table_functions.cpp
 )

@@ -15,6 +15,135 @@ namespace duckdb {
 // Geometry helpers - extract coordinates from GEOMETRY (WKB) type
 // ============================================================================
 
+// Check if a point is inside a polygon ring using ray casting algorithm
+static bool PointInRing(double px, double py, const double* ring_coords, uint32_t num_points) {
+    bool inside = false;
+    double x1, y1, x2, y2;
+
+    for (uint32_t i = 0, j = num_points - 1; i < num_points; j = i++) {
+        x1 = ring_coords[i * 2];
+        y1 = ring_coords[i * 2 + 1];
+        x2 = ring_coords[j * 2];
+        y2 = ring_coords[j * 2 + 1];
+
+        if (((y1 > py) != (y2 > py)) &&
+            (px < (x2 - x1) * (py - y1) / (y2 - y1) + x1)) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+// Check if a point is inside a polygon (handles holes)
+static bool PointInPolygon(double px, double py, const uint8_t* data, idx_t& offset, idx_t size) {
+    if (size < offset + 4) return false;
+    uint32_t num_rings;
+    memcpy(&num_rings, data + offset, 4);
+    offset += 4;
+
+    if (num_rings == 0) return false;
+
+    // First ring is outer boundary
+    if (size < offset + 4) return false;
+    uint32_t outer_points;
+    memcpy(&outer_points, data + offset, 4);
+    offset += 4;
+
+    if (size < offset + outer_points * 16) return false;
+
+    std::vector<double> outer_coords(outer_points * 2);
+    for (uint32_t i = 0; i < outer_points; i++) {
+        memcpy(&outer_coords[i * 2], data + offset + i * 16, 8);
+        memcpy(&outer_coords[i * 2 + 1], data + offset + i * 16 + 8, 8);
+    }
+    offset += outer_points * 16;
+
+    // Check if inside outer boundary
+    if (!PointInRing(px, py, outer_coords.data(), outer_points)) {
+        // Skip remaining rings
+        for (uint32_t r = 1; r < num_rings; r++) {
+            if (size < offset + 4) return false;
+            uint32_t ring_points;
+            memcpy(&ring_points, data + offset, 4);
+            offset += 4 + ring_points * 16;
+        }
+        return false;
+    }
+
+    // Check holes (if inside a hole, point is outside polygon)
+    for (uint32_t r = 1; r < num_rings; r++) {
+        if (size < offset + 4) return false;
+        uint32_t hole_points;
+        memcpy(&hole_points, data + offset, 4);
+        offset += 4;
+
+        if (size < offset + hole_points * 16) return false;
+
+        std::vector<double> hole_coords(hole_points * 2);
+        for (uint32_t i = 0; i < hole_points; i++) {
+            memcpy(&hole_coords[i * 2], data + offset + i * 16, 8);
+            memcpy(&hole_coords[i * 2 + 1], data + offset + i * 16 + 8, 8);
+        }
+        offset += hole_points * 16;
+
+        if (PointInRing(px, py, hole_coords.data(), hole_points)) {
+            return false;  // Inside a hole
+        }
+    }
+
+    return true;
+}
+
+// Check if a point is inside a geometry (works for POLYGON and MULTIPOLYGON)
+static bool PointInGeometry(double px, double py, const string_t &geom) {
+    const uint8_t *data = reinterpret_cast<const uint8_t*>(geom.GetData());
+    idx_t size = geom.GetSize();
+
+    if (size < 5) return false;
+
+    uint32_t geom_type;
+    memcpy(&geom_type, data + 1, 4);
+
+    uint32_t base_type = geom_type & 0xFF;
+    idx_t offset = 5;
+
+    // Handle SRID prefix
+    if (geom_type & 0x20000000) {
+        offset += 4;
+    }
+
+    if (base_type == 3) {  // POLYGON
+        return PointInPolygon(px, py, data, offset, size);
+    } else if (base_type == 6) {  // MULTIPOLYGON
+        if (size < offset + 4) return false;
+        uint32_t num_polygons;
+        memcpy(&num_polygons, data + offset, 4);
+        offset += 4;
+
+        for (uint32_t poly = 0; poly < num_polygons; poly++) {
+            // Skip WKB header for nested polygon
+            if (size < offset + 5) return false;
+            offset += 5;
+
+            // Handle SRID in nested polygon if present
+            uint32_t poly_type;
+            memcpy(&poly_type, data + offset - 4, 4);
+            if (poly_type & 0x20000000) {
+                offset += 4;
+            }
+
+            idx_t poly_offset = offset;
+            if (PointInPolygon(px, py, data, poly_offset, size)) {
+                return true;
+            }
+            offset = poly_offset;
+        }
+        return false;
+    }
+
+    return false;
+}
+
 // Extract X and Y from a GEOMETRY POINT value
 // Returns true on success, false if not a valid point
 static bool ExtractPointCoordinates(const string_t &geom, double &x, double &y) {
@@ -380,6 +509,79 @@ static void QuadbinIntersectsFunction(DataChunk &args, ExpressionState &state, V
 }
 
 // ============================================================================
+// PostGIS-like Spatial Predicate Functions
+// ============================================================================
+
+// ST_Intersects(block, geometry) -> BOOLEAN
+// PostGIS-like API: Returns TRUE if the tile's bounding box intersects the geometry
+// Users don't need to understand quadbins - they just think of 'block' as tile location
+static void STIntersectsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    args.data[0].Flatten(args.size());
+    args.data[1].Flatten(args.size());
+
+    auto cell_data = FlatVector::GetData<uint64_t>(args.data[0]);
+    auto geom_data = FlatVector::GetData<string_t>(args.data[1]);
+    auto result_data = FlatVector::GetData<bool>(result);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        auto cell = cell_data[i];
+        auto geom = geom_data[i];
+
+        double query_min_lon, query_min_lat, query_max_lon, query_max_lat;
+        if (!ExtractBoundingBox(geom, query_min_lon, query_min_lat, query_max_lon, query_max_lat)) {
+            throw InvalidInputException("ST_Intersects: could not extract bounding box from geometry");
+        }
+
+        // Get tile bbox
+        int tile_x, tile_y, z;
+        quadbin::cell_to_tile(cell, tile_x, tile_y, z);
+
+        double tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat;
+        quadbin::tile_to_bbox_wgs84(tile_x, tile_y, z, tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat);
+
+        // Check for bbox intersection (fast O(1) comparison)
+        bool intersects = !(tile_max_lon < query_min_lon ||  // tile is left of query
+                           tile_min_lon > query_max_lon ||  // tile is right of query
+                           tile_max_lat < query_min_lat ||  // tile is below query
+                           tile_min_lat > query_max_lat);   // tile is above query
+
+        result_data[i] = intersects;
+    }
+}
+
+// ST_Contains(geometry, block) -> BOOLEAN
+// PostGIS-like API: Returns TRUE if the geometry fully contains the tile
+// Note: argument order matches PostGIS convention (container, contained)
+static void STContainsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    args.data[0].Flatten(args.size());
+    args.data[1].Flatten(args.size());
+
+    auto geom_data = FlatVector::GetData<string_t>(args.data[0]);
+    auto cell_data = FlatVector::GetData<uint64_t>(args.data[1]);
+    auto result_data = FlatVector::GetData<bool>(result);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        auto geom = geom_data[i];
+        auto cell = cell_data[i];
+
+        // Get tile bounds
+        int tile_x, tile_y, z;
+        quadbin::cell_to_tile(cell, tile_x, tile_y, z);
+
+        double tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat;
+        quadbin::tile_to_bbox_wgs84(tile_x, tile_y, z, tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat);
+
+        // Check if ALL four tile corners are inside the geometry
+        bool contains = PointInGeometry(tile_min_lon, tile_min_lat, geom) &&  // SW corner
+                        PointInGeometry(tile_max_lon, tile_min_lat, geom) &&  // SE corner
+                        PointInGeometry(tile_min_lon, tile_max_lat, geom) &&  // NW corner
+                        PointInGeometry(tile_max_lon, tile_max_lat, geom);    // NE corner
+
+        result_data[i] = contains;
+    }
+}
+
+// ============================================================================
 // Spatial Format Functions (for DuckDB Spatial compatibility)
 // ============================================================================
 
@@ -582,6 +784,63 @@ static void QuadbinSiblingFunction(DataChunk &args, ExpressionState &state, Vect
     ListVector::SetListSize(result, total_siblings);
 }
 
+// ============================================================================
+// ST_GeomFromQuadbin - Convert quadbin to GEOMETRY
+// ============================================================================
+
+// Helper to create WKB polygon from tile bounds
+static std::vector<uint8_t> CreateWKBPolygon(double min_lon, double min_lat, double max_lon, double max_lat) {
+    std::vector<uint8_t> wkb;
+    wkb.reserve(93);  // 1 + 4 + 4 + 4 + 5*16 = 93 bytes for a simple polygon
+
+    // Byte order: little endian
+    wkb.push_back(0x01);
+
+    // Geometry type: Polygon (3)
+    uint32_t geom_type = 3;
+    wkb.insert(wkb.end(), reinterpret_cast<uint8_t*>(&geom_type), reinterpret_cast<uint8_t*>(&geom_type) + 4);
+
+    // Number of rings: 1
+    uint32_t num_rings = 1;
+    wkb.insert(wkb.end(), reinterpret_cast<uint8_t*>(&num_rings), reinterpret_cast<uint8_t*>(&num_rings) + 4);
+
+    // Number of points in ring: 5 (closed polygon)
+    uint32_t num_points = 5;
+    wkb.insert(wkb.end(), reinterpret_cast<uint8_t*>(&num_points), reinterpret_cast<uint8_t*>(&num_points) + 4);
+
+    // Points: SW, SE, NE, NW, SW (closed)
+    auto add_point = [&wkb](double x, double y) {
+        wkb.insert(wkb.end(), reinterpret_cast<uint8_t*>(&x), reinterpret_cast<uint8_t*>(&x) + 8);
+        wkb.insert(wkb.end(), reinterpret_cast<uint8_t*>(&y), reinterpret_cast<uint8_t*>(&y) + 8);
+    };
+
+    add_point(min_lon, min_lat);  // SW
+    add_point(max_lon, min_lat);  // SE
+    add_point(max_lon, max_lat);  // NE
+    add_point(min_lon, max_lat);  // NW
+    add_point(min_lon, min_lat);  // SW (close)
+
+    return wkb;
+}
+
+// ST_GeomFromQuadbin(cell) -> GEOMETRY
+// Returns the tile boundary as a GEOMETRY polygon
+static void STGeomFromQuadbinFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    auto &cell_vec = args.data[0];
+
+    UnaryExecutor::Execute<uint64_t, string_t>(cell_vec, result, args.size(),
+        [&](uint64_t cell) {
+            int x, y, z;
+            quadbin::cell_to_tile(cell, x, y, z);
+
+            double min_lon, min_lat, max_lon, max_lat;
+            quadbin::tile_to_bbox_wgs84(x, y, z, min_lon, min_lat, max_lon, max_lat);
+
+            auto wkb = CreateWKBPolygon(min_lon, min_lat, max_lon, max_lat);
+            return StringVector::AddStringOrBlob(result, reinterpret_cast<const char*>(wkb.data()), wkb.size());
+        });
+}
+
 // quadbin_kring(cell, k) -> LIST(UBIGINT)
 // Get cells within k distance from center
 static void QuadbinKringFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -710,6 +969,26 @@ void RegisterQuadbinFunctions(ExtensionLoader &loader) {
     loader.RegisterFunction(intersects);
 
     // ========================================================================
+    // PostGIS-like Spatial Predicate Functions
+    // ========================================================================
+
+    // ST_Intersects(block, geometry) -> BOOLEAN
+    // PostGIS-like API for raster-vector intersection
+    ScalarFunction st_intersects("ST_Intersects",
+        {LogicalType::UBIGINT, LogicalType::GEOMETRY()},
+        LogicalType::BOOLEAN,
+        STIntersectsFunction);
+    loader.RegisterFunction(st_intersects);
+
+    // ST_Contains(geometry, block) -> BOOLEAN
+    // PostGIS-like API: geometry contains tile
+    ScalarFunction st_contains("ST_Contains",
+        {LogicalType::GEOMETRY(), LogicalType::UBIGINT},
+        LogicalType::BOOLEAN,
+        STContainsFunction);
+    loader.RegisterFunction(st_contains);
+
+    // ========================================================================
     // Spatial Format Functions (DuckDB Spatial compatibility)
     // ========================================================================
 
@@ -790,6 +1069,18 @@ void RegisterQuadbinFunctions(ExtensionLoader &loader) {
         LogicalType::LIST(LogicalType::UBIGINT),
         QuadbinKringFunction);
     loader.RegisterFunction(kring);
+
+    // ========================================================================
+    // Geometry Conversion Functions
+    // ========================================================================
+
+    // ST_GeomFromQuadbin(cell) -> GEOMETRY
+    // Returns the tile boundary as a GEOMETRY polygon
+    ScalarFunction geom_from_quadbin("ST_GeomFromQuadbin",
+        {LogicalType::UBIGINT},
+        LogicalType::GEOMETRY(),
+        STGeomFromQuadbinFunction);
+    loader.RegisterFunction(geom_from_quadbin);
 }
 
 } // namespace duckdb
