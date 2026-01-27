@@ -5,3 +5,9 @@ duckdb_extension_load(raquet
     INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/src/include
     LOAD_TESTS
 )
+
+# Include httpfs for remote file access
+duckdb_extension_load(httpfs
+    GIT_URL https://github.com/duckdb/duckdb-httpfs
+    GIT_TAG add35a03c1adfe530bb4ef69133b94fe8ec8ea35
+)

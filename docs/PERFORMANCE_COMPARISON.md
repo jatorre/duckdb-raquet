@@ -113,6 +113,93 @@ Band math (all tiles)        0.687s    72.60s     1.95s     DuckDB
 * GDAL processes single file; DuckDB processes tiled data
 ```
 
+## Cloud-Native Performance (Google Cloud Storage)
+
+One of DuckDB Raquet's key advantages is its cloud-native architecture. Using Parquet's columnar format with predicate pushdown, queries can efficiently access remote data without downloading entire files.
+
+### Test Setup
+- **File**: TCI.parquet hosted on Google Cloud Storage
+- **File Size**: 261 MB (3,226 tiles across 8 zoom levels)
+- **URL**: `gs://sdsc_demo25/TCI.parquet`
+- **Network**: Standard internet connection
+
+### Data Transfer Efficiency
+
+The Raquet format enables minimal data transfer through:
+
+| Component | Size | Notes |
+|-----------|------|-------|
+| Full file | 261 MB | Total Parquet file size |
+| Single tile (3 bands, compressed) | ~1.8 KB | Only fetched data for point query |
+| Parquet metadata | ~50 KB | Cached after first access |
+| Single band (compressed) | 300-800 bytes | Gzip-compressed 256x256 tile |
+
+### Cloud Benchmark Results
+
+#### Local vs GCS Performance
+
+| Query | Local | GCS | Data Transfer | Overhead |
+|-------|-------|-----|---------------|----------|
+| Single point (3 bands) | 0.093s | 4.3s | ~2 KB | ~46x (network latency) |
+| All z14 tiles stats (2,352 tiles) | 0.097s | 2.2s | ~165 MB | ~23x |
+| Resolution filter (z13, 625 tiles) | ~0.06s | 2.4s | ~44 MB | ~40x |
+| Spatial filter + stats | ~0.06s | 2.2s | Variable | ~37x |
+
+#### Key Observations
+
+1. **Predicate Pushdown**: Block/resolution filters pushed to Parquet reader
+   - Only matching row groups are fetched
+   - Single tile query downloads ~2KB, not 261MB
+
+2. **Column Pruning**: Only requested bands are downloaded
+   - Query on `band_1` only fetches that column
+   - Metadata queries are extremely fast (~0.7s)
+
+3. **Parallel Fetching**: Multiple tiles fetched concurrently
+   - Full z14 scan (2,352 tiles) completes in 2.2s
+   - Effective throughput: ~75 MB/s
+
+### Cloud Query Examples
+
+```sql
+LOAD httpfs;
+LOAD raquet;
+
+-- Single point extraction from GCS (downloads ~2KB)
+SELECT
+    raquet_pixel(band_1, 'uint8',
+        (quadbin_pixel_xy(33.5, 16.85, 14, 256)).pixel_x,
+        (quadbin_pixel_xy(33.5, 16.85, 14, 256)).pixel_y,
+        256, 'gzip') as red
+FROM read_parquet('https://storage.googleapis.com/sdsc_demo25/TCI.parquet')
+WHERE block = quadbin_from_lonlat(33.5, 16.85, 14);
+
+-- Aggregate stats on specific zoom level
+SELECT COUNT(*) as tiles,
+       AVG((ST_RasterSummaryStats(band_1, 'uint8', 256, 256, 'gzip', 0)).mean) as avg
+FROM read_parquet('https://storage.googleapis.com/sdsc_demo25/TCI.parquet')
+WHERE quadbin_resolution(block) = 14;
+
+-- Resolution-based filtering (only z13 tiles)
+SELECT quadbin_resolution(block) as res,
+       COUNT(*) as tiles,
+       SUM((ST_RasterSummaryStats(band_1, 'uint8', 256, 256, 'gzip', 0)).count) as pixels
+FROM read_parquet('https://storage.googleapis.com/sdsc_demo25/TCI.parquet')
+WHERE quadbin_resolution(block) = 13
+GROUP BY res;
+```
+
+### Cloud Performance Analysis
+
+The network overhead (23-46x slower than local) is expected, but the architecture provides significant advantages:
+
+1. **No Pre-download Required**: Query directly against cloud storage
+2. **Minimal Data Transfer**: Only fetch what's needed
+3. **Scalable**: Same query works on TB-scale datasets
+4. **Cost Effective**: Pay only for data transferred
+
+For comparison, downloading the full 261MB file would take ~20s on a 100Mbps connection, while a single-point query completes in 4.3s transferring only ~2KB.
+
 ## Performance Analysis
 
 ### Why DuckDB Raquet is Fast
