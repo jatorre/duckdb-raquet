@@ -147,6 +147,19 @@ WHERE block = quadbin_from_lonlat(-73.9857, 40.7484, 13);
 | `ST_RasterSummaryStats(band, dtype, w, h, compression, nodata)` | Stats with nodata filter | `STRUCT(...)` |
 | `ST_RegionStats(band, block, region, metadata)` | Aggregate stats for pixels within geometry | `STRUCT(...)` |
 | `ST_RegionStats(band, block, region, metadata, nodata)` | Region stats with nodata filter | `STRUCT(...)` |
+| `ST_Clip(band, block, geometry, metadata)` | Extract pixel values within geometry | `DOUBLE[]` |
+| `ST_Clip(band, block, geometry, metadata, nodata)` | Clip with nodata filtering | `DOUBLE[]` |
+| `ST_ClipMask(band, block, geometry, metadata, nodata)` | Full tile with outside pixels set to nodata | `DOUBLE[]` |
+
+### Band Math Functions
+
+| Function | Description | Return Type |
+|----------|-------------|-------------|
+| `ST_NormalizedDifference(band1, band2, metadata)` | Compute (band1-band2)/(band1+band2) per pixel | `DOUBLE[]` |
+| `ST_NormalizedDifference(band1, band2, metadata, nodata)` | Normalized difference with nodata handling | `DOUBLE[]` |
+| `ST_NDVI(nir_band, red_band, metadata)` | Vegetation index (alias for normalized difference) | `DOUBLE[]` |
+| `ST_BandMath(band1, band2, operation, metadata)` | Generic band math: add, subtract, multiply, divide, ndiff | `DOUBLE[]` |
+| `ST_NormalizedDifferenceStats(band1, band2, metadata)` | Statistics of normalized difference | `STRUCT(...)` |
 
 ### Metadata Functions
 
@@ -405,6 +418,62 @@ WHERE ST_Contains(
   AND block != 0;
 ```
 
+### Clipping Rasters
+
+```sql
+LOAD spatial;
+LOAD raquet;
+
+-- Extract pixel values within a polygon
+WITH meta AS (
+    SELECT metadata FROM read_parquet('dem.parquet') WHERE block = 0
+)
+SELECT
+    block,
+    ST_Clip(band_1, block,
+        ST_GeomFromText('POLYGON((-74.0 40.7, -73.9 40.7, -73.9 40.8, -74.0 40.8, -74.0 40.7))'),
+        (SELECT metadata FROM meta)
+    ) AS clipped_values
+FROM read_parquet('dem.parquet')
+WHERE block != 0
+  AND ST_Intersects(block, ST_GeomFromText('POLYGON((-74.0 40.7, -73.9 40.7, -73.9 40.8, -74.0 40.8, -74.0 40.7))'));
+
+-- Get full tile with outside pixels masked to nodata
+SELECT ST_ClipMask(band_1, block, clip_geom, metadata, -9999.0) AS masked_tile
+FROM raster_data;
+```
+
+### Band Math and Vegetation Indices
+
+```sql
+LOAD raquet;
+
+-- Calculate NDVI (Normalized Difference Vegetation Index)
+-- NDVI = (NIR - Red) / (NIR + Red)
+WITH meta AS (
+    SELECT metadata FROM read_parquet('satellite.parquet') WHERE block = 0
+)
+SELECT
+    block,
+    ST_NDVI(band_4, band_3, (SELECT metadata FROM meta)) AS ndvi_values
+FROM read_parquet('satellite.parquet')
+WHERE block != 0;
+
+-- Get NDVI statistics directly (more efficient than computing array first)
+SELECT
+    block,
+    (ST_NormalizedDifferenceStats(band_4, band_3, metadata)).*
+FROM satellite_data
+WHERE block != 0;
+-- Returns: count, sum, mean, min, max, stddev
+
+-- Generic band math operations
+SELECT ST_BandMath(band_1, band_2, 'subtract', metadata) AS difference
+FROM raster_data;
+
+-- Supported operations: 'add', 'subtract', 'multiply', 'divide', 'ndiff'
+```
+
 ## Raquet File Format
 
 A Raquet file is a Parquet file with specific conventions:
@@ -428,6 +497,47 @@ A Raquet file is a Parquet file with specific conventions:
   ]
 }
 ```
+
+## Coordinate System and Projections
+
+**Important:** This extension works exclusively with **Web Mercator (EPSG:3857)** tiled rasters.
+
+### How It Works
+
+- **QUADBIN** encodes XYZ tile coordinates from the Web Mercator tile pyramid
+- User queries use **WGS84 lon/lat (EPSG:4326)** which are converted internally
+- All tiles are axis-aligned (no rotation or skew supported)
+
+### Comparison with PostGIS Raster
+
+| Feature | PostGIS Raster | DuckDB Raquet |
+|---------|---------------|---------------|
+| Projections | Any SRID (UTM, Albers, etc.) | Web Mercator only |
+| Geotransform | Full 6-parameter affine | Implicit from QUADBIN |
+| Rotation/Skew | Supported | Not supported |
+| Reprojection | On-the-fly | Pre-tile to Web Mercator |
+| Spatial Index | R-tree (explicit) | QUADBIN (implicit) |
+
+### Why Web Mercator Only?
+
+This is a deliberate design choice for cloud-native raster workflows:
+
+1. **Simplicity** - No coordinate transformation overhead at query time
+2. **Performance** - QUADBIN provides free hierarchical spatial indexing
+3. **Compatibility** - Matches standard web mapping tile pyramids (XYZ, TMS)
+4. **Cloud-Native** - Aligns with COG and other tiled formats
+
+### Data Preparation
+
+If your raster data is in a different projection, convert it to Web Mercator tiles before loading:
+
+```bash
+# Using GDAL to create Web Mercator tiles
+gdalwarp -t_srs EPSG:3857 input.tif output_webmercator.tif
+gdal2tiles.py output_webmercator.tif tiles/
+```
+
+Or use tools like [rio-tiler](https://github.com/cogeotiff/rio-tiler) or [titiler](https://github.com/developmentseed/titiler) for dynamic tiling.
 
 ## Dependencies
 
@@ -501,8 +611,12 @@ WHERE block = quadbin_from_lonlat(-73.22, 40.91, 18);
 - [x] `ST_RegionStats()` - Aggregate raster statistics within polygon regions
 - [x] `ST_Intersects()` / `ST_Contains()` - PostGIS-like spatial predicates
 - [x] `ST_GeomFromQuadbin()` - Convert QUADBIN cell to GEOMETRY
+- [x] `ST_Clip()` / `ST_ClipMask()` - Clip rasters to geometry boundaries
+- [x] `ST_NDVI()` / `ST_NormalizedDifference()` - Vegetation and spectral indices
+- [x] `ST_BandMath()` - Generic band arithmetic operations
 
 **Planned:**
 - [ ] `read_raquet()` - Dedicated table function with automatic metadata handling
 - [ ] Performance optimizations for batch pixel extraction
 - [ ] Streaming support for large raster files
+- [ ] `ST_Resample()` - Change raster resolution (nearest-neighbor)
