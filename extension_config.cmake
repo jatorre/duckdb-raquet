@@ -15,5 +15,5 @@ duckdb_extension_load(httpfs
     GIT_TAG add35a03c1adfe530bb4ef69133b94fe8ec8ea35
 )
 
-# Note: iceberg extension can be loaded separately by users who need lakehouse integration
-# It requires additional dependencies (avro with libavro-c)
+# Note: iceberg extension requires avro with a custom-patched libavro-c
+# For now, use two-step workflow: standard DuckDB for iceberg_scan, dev DuckDB for raquet functions

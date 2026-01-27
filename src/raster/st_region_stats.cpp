@@ -252,6 +252,71 @@ static bool RegionContainsTile(const string_t &region, double tile_min_lon, doub
 }
 
 // ============================================================================
+// Resolution Selection
+// ============================================================================
+
+enum class ResolutionMode { EXPLICIT, AUTO, MAX };
+
+struct ResolutionConfig {
+    ResolutionMode mode;
+    int explicit_level;
+    int auto_max_tiles;  // Target max tiles for AUTO mode
+
+    ResolutionConfig() : mode(ResolutionMode::MAX), explicit_level(-1), auto_max_tiles(50) {}
+};
+
+// Parse resolution parameter: integer string, 'auto', or 'max'
+static ResolutionConfig ParseResolution(const std::string &resolution_str, int max_resolution) {
+    ResolutionConfig config;
+
+    if (resolution_str == "auto") {
+        config.mode = ResolutionMode::AUTO;
+    } else if (resolution_str == "max" || resolution_str.empty()) {
+        config.mode = ResolutionMode::MAX;
+        config.explicit_level = max_resolution;
+    } else {
+        // Try to parse as integer
+        try {
+            config.mode = ResolutionMode::EXPLICIT;
+            config.explicit_level = std::stoi(resolution_str);
+            if (config.explicit_level < 0 || config.explicit_level > max_resolution) {
+                throw InvalidInputException("ST_RegionStats: Resolution must be between 0 and %d, got %d",
+                                            max_resolution, config.explicit_level);
+            }
+        } catch (const std::invalid_argument &) {
+            throw InvalidInputException("ST_RegionStats: Invalid resolution '%s'. Use integer (0-%d), 'auto', or 'max'",
+                                        resolution_str.c_str(), max_resolution);
+        }
+    }
+    return config;
+}
+
+// Estimate optimal resolution based on tile count
+// At zoom Z, each tile covers: width = 360/2^Z degrees, height = 180/2^Z degrees
+// Pick highest Z where estimated_tiles <= max_tiles
+static int EstimateAutoResolution(double min_lon, double min_lat, double max_lon, double max_lat,
+                                   int min_resolution, int max_resolution, int max_tiles = 50) {
+    double bbox_width = max_lon - min_lon;
+    double bbox_height = max_lat - min_lat;
+
+    // Search from max resolution down to min
+    for (int z = max_resolution; z >= min_resolution; z--) {
+        double tile_width = 360.0 / (1 << z);   // 360 / 2^z
+        double tile_height = 180.0 / (1 << z);  // 180 / 2^z
+
+        int tiles_x = static_cast<int>(std::ceil(bbox_width / tile_width));
+        int tiles_y = static_cast<int>(std::ceil(bbox_height / tile_height));
+        int estimated_tiles = tiles_x * tiles_y;
+
+        if (estimated_tiles <= max_tiles) {
+            return z;
+        }
+    }
+
+    return min_resolution;  // Fallback to coarsest
+}
+
+// ============================================================================
 // ST_RegionStats Aggregate State
 // ============================================================================
 
@@ -272,6 +337,8 @@ struct RaquetMetadata {
     std::string compression;
     int block_width;
     int block_height;
+    int min_resolution;
+    int max_resolution;
     std::vector<std::pair<std::string, std::string>> bands;
 
     static RaquetMetadata Parse(const std::string &json_str) {
@@ -279,6 +346,8 @@ struct RaquetMetadata {
         meta.compression = "none";
         meta.block_width = 256;
         meta.block_height = 256;
+        meta.min_resolution = 0;
+        meta.max_resolution = 26;
 
         yyjson_doc *doc = yyjson_read(json_str.c_str(), json_str.length(), 0);
         if (!doc) {
@@ -304,6 +373,16 @@ struct RaquetMetadata {
         yyjson_val *height_val = yyjson_obj_get(root, "block_height");
         if (height_val && yyjson_is_int(height_val)) {
             meta.block_height = yyjson_get_int(height_val);
+        }
+
+        yyjson_val *minres_val = yyjson_obj_get(root, "minresolution");
+        if (minres_val && yyjson_is_int(minres_val)) {
+            meta.min_resolution = yyjson_get_int(minres_val);
+        }
+
+        yyjson_val *maxres_val = yyjson_obj_get(root, "maxresolution");
+        if (maxres_val && yyjson_is_int(maxres_val)) {
+            meta.max_resolution = yyjson_get_int(maxres_val);
         }
 
         yyjson_val *bands_val = yyjson_obj_get(root, "bands");
@@ -333,17 +412,23 @@ struct RaquetMetadata {
 struct RegionStatsBindData : public FunctionData {
     bool has_nodata;
     double nodata;
+    bool has_resolution;
+    std::string resolution_str;
 
-    RegionStatsBindData() : has_nodata(false), nodata(0.0) {}
-    RegionStatsBindData(bool has_nodata_p, double nodata_p) : has_nodata(has_nodata_p), nodata(nodata_p) {}
+    RegionStatsBindData()
+        : has_nodata(false), nodata(0.0), has_resolution(false), resolution_str("max") {}
+
+    RegionStatsBindData(bool has_nodata_p, double nodata_p, bool has_resolution_p, const std::string &resolution_p)
+        : has_nodata(has_nodata_p), nodata(nodata_p), has_resolution(has_resolution_p), resolution_str(resolution_p) {}
 
     unique_ptr<FunctionData> Copy() const override {
-        return make_uniq<RegionStatsBindData>(has_nodata, nodata);
+        return make_uniq<RegionStatsBindData>(has_nodata, nodata, has_resolution, resolution_str);
     }
 
     bool Equals(const FunctionData &other_p) const override {
         auto &other = other_p.Cast<RegionStatsBindData>();
-        return has_nodata == other.has_nodata && nodata == other.nodata;
+        return has_nodata == other.has_nodata && nodata == other.nodata &&
+               has_resolution == other.has_resolution && resolution_str == other.resolution_str;
     }
 };
 
@@ -432,18 +517,23 @@ static void RegionStatsFinalize(Vector &states, AggregateInputData &aggr_input_d
 // Helper function to process a tile for region stats
 static void ProcessTileForRegionStats(RegionStatsState &state, const string_t &band, uint64_t block,
                                        const string_t &region, const RaquetMetadata &meta,
-                                       bool has_nodata, double nodata) {
+                                       bool has_nodata, double nodata, int target_resolution) {
     if (band.GetSize() == 0) return;
     if (meta.bands.empty()) return;
+
+    // Get tile resolution and filter
+    int tile_x, tile_y, tile_z;
+    quadbin::cell_to_tile(block, tile_x, tile_y, tile_z);
+
+    // Skip tiles not at target resolution (if specified, -1 means no filter)
+    if (target_resolution >= 0 && tile_z != target_resolution) {
+        return;
+    }
 
     std::string dtype = meta.bands[0].second;
     bool compressed = (meta.compression == "gzip");
     int width = meta.block_width;
     int height = meta.block_height;
-
-    // Get tile bounds from block
-    int tile_x, tile_y, tile_z;
-    quadbin::cell_to_tile(block, tile_x, tile_y, tile_z);
 
     double tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat;
     quadbin::tile_to_bbox_wgs84(tile_x, tile_y, tile_z, tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat);
@@ -545,7 +635,10 @@ static void RegionStatsUpdate(Vector inputs[], AggregateInputData &aggr_input_da
 
         try {
             auto meta = RaquetMetadata::Parse(metadata_data[i].GetString());
-            ProcessTileForRegionStats(state, band_data[i], block_data[i], region_data[i], meta, false, 0.0);
+            // Default: use max resolution (no filtering, -1 = all resolutions pass through,
+            // but we actually want only max resolution for backward compatibility)
+            int target_res = meta.max_resolution;
+            ProcessTileForRegionStats(state, band_data[i], block_data[i], region_data[i], meta, false, 0.0, target_res);
         } catch (...) {
             // Skip tiles with errors
             continue;
@@ -584,7 +677,107 @@ static void RegionStatsUpdateNodata(Vector inputs[], AggregateInputData &aggr_in
 
         try {
             auto meta = RaquetMetadata::Parse(metadata_data[i].GetString());
-            ProcessTileForRegionStats(state, band_data[i], block_data[i], region_data[i], meta, has_nodata, nodata);
+            int target_res = meta.max_resolution;
+            ProcessTileForRegionStats(state, band_data[i], block_data[i], region_data[i], meta, has_nodata, nodata, target_res);
+        } catch (...) {
+            continue;
+        }
+    }
+}
+
+// Helper to compute target resolution from string and geometry
+static int ComputeTargetResolution(const std::string &resolution_str, const string_t &region,
+                                    const RaquetMetadata &meta) {
+    auto config = ParseResolution(resolution_str, meta.max_resolution);
+
+    if (config.mode == ResolutionMode::MAX) {
+        return meta.max_resolution;
+    } else if (config.mode == ResolutionMode::EXPLICIT) {
+        return config.explicit_level;
+    } else {  // AUTO
+        double min_lon, min_lat, max_lon, max_lat;
+        if (!ExtractGeometryBBox(region, min_lon, min_lat, max_lon, max_lat)) {
+            return meta.max_resolution;  // Fallback
+        }
+        return EstimateAutoResolution(min_lon, min_lat, max_lon, max_lat,
+                                       meta.min_resolution, meta.max_resolution);
+    }
+}
+
+// Update function for 5-argument version (with resolution)
+static void RegionStatsUpdateResolution(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                         Vector &state_vector, idx_t count) {
+    inputs[0].Flatten(count);
+    inputs[1].Flatten(count);
+    inputs[2].Flatten(count);
+    inputs[3].Flatten(count);
+    inputs[4].Flatten(count);
+
+    auto band_data = FlatVector::GetData<string_t>(inputs[0]);
+    auto block_data = FlatVector::GetData<uint64_t>(inputs[1]);
+    auto region_data = FlatVector::GetData<string_t>(inputs[2]);
+    auto metadata_data = FlatVector::GetData<string_t>(inputs[3]);
+    auto resolution_data = FlatVector::GetData<string_t>(inputs[4]);
+
+    auto &band_validity = FlatVector::Validity(inputs[0]);
+    auto &region_validity = FlatVector::Validity(inputs[2]);
+
+    auto states = FlatVector::GetData<RegionStatsState *>(state_vector);
+
+    for (idx_t i = 0; i < count; i++) {
+        if (!band_validity.RowIsValid(i) || !region_validity.RowIsValid(i)) {
+            continue;
+        }
+
+        auto &state = *states[i];
+
+        try {
+            auto meta = RaquetMetadata::Parse(metadata_data[i].GetString());
+            std::string res_str = resolution_data[i].GetString();
+            int target_res = ComputeTargetResolution(res_str, region_data[i], meta);
+            ProcessTileForRegionStats(state, band_data[i], block_data[i], region_data[i], meta, false, 0.0, target_res);
+        } catch (...) {
+            continue;
+        }
+    }
+}
+
+// Update function for 6-argument version (with nodata + resolution)
+static void RegionStatsUpdateNodataResolution(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                               Vector &state_vector, idx_t count) {
+    inputs[0].Flatten(count);
+    inputs[1].Flatten(count);
+    inputs[2].Flatten(count);
+    inputs[3].Flatten(count);
+    inputs[4].Flatten(count);
+    inputs[5].Flatten(count);
+
+    auto band_data = FlatVector::GetData<string_t>(inputs[0]);
+    auto block_data = FlatVector::GetData<uint64_t>(inputs[1]);
+    auto region_data = FlatVector::GetData<string_t>(inputs[2]);
+    auto metadata_data = FlatVector::GetData<string_t>(inputs[3]);
+    auto nodata_data = FlatVector::GetData<double>(inputs[4]);
+    auto resolution_data = FlatVector::GetData<string_t>(inputs[5]);
+
+    auto &band_validity = FlatVector::Validity(inputs[0]);
+    auto &region_validity = FlatVector::Validity(inputs[2]);
+
+    auto states = FlatVector::GetData<RegionStatsState *>(state_vector);
+
+    for (idx_t i = 0; i < count; i++) {
+        if (!band_validity.RowIsValid(i) || !region_validity.RowIsValid(i)) {
+            continue;
+        }
+
+        auto &state = *states[i];
+        double nodata = nodata_data[i];
+        bool has_nodata = !std::isnan(nodata);
+
+        try {
+            auto meta = RaquetMetadata::Parse(metadata_data[i].GetString());
+            std::string res_str = resolution_data[i].GetString();
+            int target_res = ComputeTargetResolution(res_str, region_data[i], meta);
+            ProcessTileForRegionStats(state, band_data[i], block_data[i], region_data[i], meta, has_nodata, nodata, target_res);
         } catch (...) {
             continue;
         }
@@ -638,6 +831,37 @@ void RegisterRegionStatsFunctions(ExtensionLoader &loader) {
         RegionStatsBind
     );
     region_stats_set.AddFunction(region_stats_nodata);
+
+    // ST_RegionStats(band BLOB, block UBIGINT, region GEOMETRY, metadata VARCHAR, resolution VARCHAR)
+    // resolution can be: integer (0-26), 'auto', or 'max'
+    AggregateFunction region_stats_resolution(
+        {LogicalType::BLOB, LogicalType::UBIGINT, LogicalType::GEOMETRY(), LogicalType::VARCHAR, LogicalType::VARCHAR},
+        stats_type,
+        RegionStatsStateSize,
+        RegionStatsStateInitialize,
+        RegionStatsUpdateResolution,
+        RegionStatsCombine,
+        RegionStatsFinalize,
+        FunctionNullHandling::DEFAULT_NULL_HANDLING,
+        nullptr,
+        RegionStatsBind
+    );
+    region_stats_set.AddFunction(region_stats_resolution);
+
+    // ST_RegionStats(band BLOB, block UBIGINT, region GEOMETRY, metadata VARCHAR, nodata DOUBLE, resolution VARCHAR)
+    AggregateFunction region_stats_nodata_resolution(
+        {LogicalType::BLOB, LogicalType::UBIGINT, LogicalType::GEOMETRY(), LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::VARCHAR},
+        stats_type,
+        RegionStatsStateSize,
+        RegionStatsStateInitialize,
+        RegionStatsUpdateNodataResolution,
+        RegionStatsCombine,
+        RegionStatsFinalize,
+        FunctionNullHandling::DEFAULT_NULL_HANDLING,
+        nullptr,
+        RegionStatsBind
+    );
+    region_stats_set.AddFunction(region_stats_nodata_resolution);
 
     loader.RegisterFunction(region_stats_set);
 }

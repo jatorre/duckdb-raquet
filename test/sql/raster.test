@@ -198,6 +198,41 @@ SELECT raquet_is_data_row(NULL)
 NULL
 
 # =============================================================================
+# Test ST_RegionStats resolution parameter
+# =============================================================================
+
+# Create test tiles at different resolutions
+statement ok
+CREATE TABLE test_resolution AS
+SELECT * FROM (VALUES
+    -- Resolution 5 tile (z=5)
+    (quadbin_from_tile(15, 10, 5), '\x0A\x14\x1E\x28'::BLOB),
+    -- Resolution 6 tile (z=6)
+    (quadbin_from_tile(30, 20, 6), '\x0B\x15\x1F\x29'::BLOB),
+    -- Resolution 7 tile (z=7)
+    (quadbin_from_tile(60, 40, 7), '\x0C\x16\x20\x2A'::BLOB)
+) AS t(block, band_1)
+
+# Create metadata with resolution info
+statement ok
+CREATE TABLE test_meta AS
+SELECT '{"compression":"none","block_width":2,"block_height":2,"minresolution":5,"maxresolution":7,"bands":[["band_1","uint8"]]}'::VARCHAR as metadata
+
+# Verify tiles are at different resolutions
+query II
+SELECT quadbin_resolution(block) as res, block FROM test_resolution ORDER BY res
+----
+5	5211641135193128959
+6	5216141436285616127
+7	5220644211279265791
+
+statement ok
+DROP TABLE test_resolution
+
+statement ok
+DROP TABLE test_meta
+
+# =============================================================================
 # Note: ST_RasterValue and quadbin_contains/quadbin_intersects require
 # the DuckDB Spatial extension for GEOMETRY types.
 # Full spatial integration tests should be run with:
