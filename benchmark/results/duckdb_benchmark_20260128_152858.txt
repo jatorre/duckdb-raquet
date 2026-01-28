@@ -1,0 +1,31 @@
+=== DuckDB Raquet Benchmark ===
+Timestamp: 20260128_152858
+Data source: GCS (HTTPS)
+
+--- System Info ---
+Darwin Javiers-MacBook-Pro.local 25.2.0 Darwin Kernel Version 25.2.0: Tue Nov 18 21:09:56 PST 2025; root:xnu-12377.61.12~1/RELEASE_ARM64_T6041 arm64
+┌────────────────┐
+│  "version"()   │
+│    varchar     │
+├────────────────┤
+│ v1.5.0-dev6345 │
+└────────────────┘
+
+--- Loading Extension ---
+┌─────────────────────────────────┐
+│ 'Extension loaded successfully' │
+│             varchar             │
+├─────────────────────────────────┤
+│ Extension loaded successfully   │
+└─────────────────────────────────┘
+
+=== Q1: Point Query (ST_RasterValue) ===
+Query: Get RGB values at Madrid coordinates (-3.7, 40.4)
+Binder Error: No function matches the given name and argument types 'ST_RasterValue(BLOB, UBIGINT, GEOMETRY, VARCHAR)'. You might need to add explicit type casts.
+	Candidate functions:
+	ST_RasterValue(UBIGINT, BLOB, GEOMETRY, VARCHAR) -> DOUBLE
+	ST_RasterValue(UBIGINT, BLOB, GEOMETRY, VARCHAR, INTEGER) -> DOUBLE
+
+
+LINE 3:         ST_RasterValue(band_1, block, 'POINT(-3.7 40.4)'::GEOMETRY, metadata) as...
+                                 ^

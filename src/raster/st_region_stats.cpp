@@ -266,7 +266,9 @@ struct ResolutionConfig {
 };
 
 // Parse resolution parameter: integer string, 'auto', or 'max'
-static ResolutionConfig ParseResolution(const std::string &resolution_str, int max_resolution) {
+// Clamps requested resolution to available range [min_resolution, max_resolution]
+// Per Raquet spec: out-of-range requests use closest available zoom level
+static ResolutionConfig ParseResolution(const std::string &resolution_str, int min_resolution, int max_resolution) {
     ResolutionConfig config;
 
     if (resolution_str == "auto") {
@@ -274,18 +276,26 @@ static ResolutionConfig ParseResolution(const std::string &resolution_str, int m
     } else if (resolution_str == "max" || resolution_str.empty()) {
         config.mode = ResolutionMode::MAX;
         config.explicit_level = max_resolution;
+    } else if (resolution_str == "min") {
+        // Allow 'min' to request coarsest available (useful for quick previews)
+        config.mode = ResolutionMode::EXPLICIT;
+        config.explicit_level = min_resolution;
     } else {
         // Try to parse as integer
         try {
             config.mode = ResolutionMode::EXPLICIT;
-            config.explicit_level = std::stoi(resolution_str);
-            if (config.explicit_level < 0 || config.explicit_level > max_resolution) {
-                throw InvalidInputException("ST_RegionStats: Resolution must be between 0 and %d, got %d",
-                                            max_resolution, config.explicit_level);
+            int requested = std::stoi(resolution_str);
+            // Clamp to available range (graceful fallback per Raquet spec)
+            if (requested < min_resolution) {
+                config.explicit_level = min_resolution;  // Use coarsest available
+            } else if (requested > max_resolution) {
+                config.explicit_level = max_resolution;  // Use finest available
+            } else {
+                config.explicit_level = requested;
             }
         } catch (const std::invalid_argument &) {
-            throw InvalidInputException("ST_RegionStats: Invalid resolution '%s'. Use integer (0-%d), 'auto', or 'max'",
-                                        resolution_str.c_str(), max_resolution);
+            throw InvalidInputException("ST_RegionStats: Invalid resolution '%s'. Use integer, 'auto', 'min', or 'max'",
+                                        resolution_str.c_str());
         }
     }
     return config;
@@ -693,7 +703,7 @@ static void RegionStatsUpdateNodata(Vector inputs[], AggregateInputData &aggr_in
 // Helper to compute target resolution from string and geometry
 static int ComputeTargetResolution(const std::string &resolution_str, const string_t &region,
                                     const RaquetMetadata &meta) {
-    auto config = ParseResolution(resolution_str, meta.max_zoom);
+    auto config = ParseResolution(resolution_str, meta.min_zoom, meta.max_zoom);
 
     if (config.mode == ResolutionMode::MAX) {
         return meta.max_zoom;

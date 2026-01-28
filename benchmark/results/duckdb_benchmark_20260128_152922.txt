@@ -1,0 +1,106 @@
+=== DuckDB Raquet Benchmark ===
+Timestamp: 20260128_152922
+Data source: GCS (HTTPS)
+
+--- System Info ---
+Darwin Javiers-MacBook-Pro.local 25.2.0 Darwin Kernel Version 25.2.0: Tue Nov 18 21:09:56 PST 2025; root:xnu-12377.61.12~1/RELEASE_ARM64_T6041 arm64
+┌────────────────┐
+│  "version"()   │
+│    varchar     │
+├────────────────┤
+│ v1.5.0-dev6345 │
+└────────────────┘
+
+--- Loading Extension ---
+┌─────────────────────────────────┐
+│ 'Extension loaded successfully' │
+│             varchar             │
+├─────────────────────────────────┤
+│ Extension loaded successfully   │
+└─────────────────────────────────┘
+
+=== Q1: Point Query (ST_RasterValue) ===
+Query: Get RGB values at Madrid coordinates (-3.7, 40.4)
+┌────────┬────────┬────────┐
+│  red   │ green  │  blue  │
+│ double │ double │ double │
+└────────┴────────┴────────┘
+           0 rows         
+
+real	0m0.756s
+user	0m0.145s
+sys	0m0.026s
+
+=== Q2: Single Tile Statistics ===
+Query: Compute statistics for first tile
+┌─────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│        block        │                                                        stats                                                        │
+│       uint64        │                struct(count bigint, sum double, mean double, min double, max double, stddev double)                 │
+├─────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 5221556531052412927 │ {'count': 65536, 'sum': 898995.0, 'mean': 13.717575073242188, 'min': 0.0, 'max': 255.0, 'stddev': 56.7949179806705} │
+└─────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+real	0m1.419s
+user	0m0.020s
+sys	0m0.018s
+
+=== Q3: Region Statistics (Madrid area) ===
+Query: Aggregate stats over Madrid polygon
+┌────────────┬──────────────┬──────────┐
+│ tile_count │ total_pixels │ avg_mean │
+│   int64    │    int128    │  double  │
+├────────────┼──────────────┼──────────┤
+│          0 │         NULL │     NULL │
+└────────────┴──────────────┴──────────┘
+
+real	0m2.795s
+user	0m0.793s
+sys	0m0.197s
+
+=== Q4: Resolution Distribution ===
+Query: Count tiles at each zoom level
+┌────────────┬────────────┐
+│ resolution │ tile_count │
+│   int32    │   int64    │
+├────────────┼────────────┤
+│          7 │          4 │
+│          8 │          4 │
+│          9 │          6 │
+│         10 │         16 │
+│         11 │         49 │
+│         12 │        169 │
+│         13 │        625 │
+│         14 │       2352 │
+└────────────┴────────────┘
+
+real	0m1.042s
+user	0m0.150s
+sys	0m0.027s
+
+=== Q5: Bounding Box Query (Spain) ===
+Query: Count tiles intersecting Spain
+┌────────────────┐
+│ tiles_in_spain │
+│     int64      │
+├────────────────┤
+│              0 │
+└────────────────┘
+
+real	0m0.847s
+user	0m0.143s
+sys	0m0.023s
+
+=== Q6: Full Table Aggregation ===
+Query: Count all tiles and resolution stats
+┌─────────────┬───────────────────┬────────────────┬────────────────┐
+│ total_tiles │ resolution_levels │ min_resolution │ max_resolution │
+│    int64    │       int64       │     int32      │     int32      │
+├─────────────┼───────────────────┼────────────────┼────────────────┤
+│        3225 │                 8 │              7 │             14 │
+└─────────────┴───────────────────┴────────────────┴────────────────┘
+
+real	0m0.823s
+user	0m0.138s
+sys	0m0.020s
+
+=== Benchmark Complete ===
