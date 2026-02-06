@@ -1,0 +1,68 @@
+# name: test/sql/read_raquet_at.test
+# description: Test read_raquet_at table macro for point queries
+# group: [raquet]
+
+require raquet
+
+require parquet
+
+# Create test data with multiple blocks at zoom 13
+statement ok
+CREATE TABLE test_raquet_at_data AS
+SELECT * FROM (VALUES
+    -- Metadata row (block=0)
+    (0::UBIGINT, NULL::BLOB,
+     '{"file_format":"raquet","compression":"none","tiling":{"block_width":256,"block_height":256,"min_zoom":13,"max_zoom":13,"scheme":"quadbin"},"bands":[{"name":"band_1","type":"float32"}]}'::VARCHAR),
+    -- Data row for Madrid (lon=-3.7038, lat=40.4168) at zoom 13
+    (5247772294570311679::UBIGINT, '\x00\x00\x48\x42'::BLOB, NULL::VARCHAR),
+    -- Data row for another location
+    (5247772294570311680::UBIGINT, '\x00\x00\xC8\x41'::BLOB, NULL::VARCHAR)
+) AS t(block, band_1, metadata);
+
+statement ok
+COPY test_raquet_at_data TO 'duckdb_unittest_tempdir/read_raquet_at_test.parquet' (FORMAT 'parquet');
+
+# Test read_raquet_at returns exactly one row for the point
+query I
+SELECT count(*) FROM read_raquet_at('duckdb_unittest_tempdir/read_raquet_at_test.parquet', -3.7038, 40.4168);
+----
+1
+
+# Test read_raquet_at returns the correct block for Madrid
+query I
+SELECT block FROM read_raquet_at('duckdb_unittest_tempdir/read_raquet_at_test.parquet', -3.7038, 40.4168);
+----
+5247772294570311679
+
+# Test that metadata is properly propagated
+query I
+SELECT metadata IS NOT NULL FROM read_raquet_at('duckdb_unittest_tempdir/read_raquet_at_test.parquet', -3.7038, 40.4168);
+----
+true
+
+# Test read_raquet_at with explicit resolution (4-arg version)
+query I
+SELECT block FROM read_raquet_at('duckdb_unittest_tempdir/read_raquet_at_test.parquet', -3.7038, 40.4168, 13);
+----
+5247772294570311679
+
+# Verify block matches quadbin_from_lonlat
+query I
+SELECT block = quadbin_from_lonlat(-3.7038, 40.4168, 13) FROM read_raquet_at('duckdb_unittest_tempdir/read_raquet_at_test.parquet', -3.7038, 40.4168);
+----
+true
+
+# Test read_raquet_at with geometry (ST_Point)
+query I
+SELECT block FROM read_raquet_at('duckdb_unittest_tempdir/read_raquet_at_test.parquet', ST_Point(-3.7038, 40.4168));
+----
+5247772294570311679
+
+# Test ST_Point, ST_X, ST_Y functions
+query RR
+SELECT ST_X(ST_Point(-3.7038, 40.4168)), ST_Y(ST_Point(-3.7038, 40.4168));
+----
+-3.7038	40.4168
+
+statement ok
+DROP TABLE test_raquet_at_data;

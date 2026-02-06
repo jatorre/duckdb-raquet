@@ -439,78 +439,6 @@ static void QuadbinPixelXYFunction(DataChunk &args, ExpressionState &state, Vect
 // Spatial Filtering Functions
 // ============================================================================
 
-// quadbin_contains(cell, point_geometry) -> BOOLEAN
-// Check if a point geometry falls within the tile represented by cell
-// Uses DuckDB 1.5+ native GEOMETRY type
-static void QuadbinContainsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    args.data[0].Flatten(args.size());
-    args.data[1].Flatten(args.size());
-
-    auto cell_data = FlatVector::GetData<uint64_t>(args.data[0]);
-    auto geom_data = FlatVector::GetData<string_t>(args.data[1]);
-    auto result_data = FlatVector::GetData<bool>(result);
-    auto &result_mask = FlatVector::Validity(result);
-
-    for (idx_t i = 0; i < args.size(); i++) {
-        auto cell = cell_data[i];
-        auto geom = geom_data[i];
-
-        double lon, lat;
-        if (!ExtractPointCoordinates(geom, lon, lat)) {
-            throw InvalidInputException("quadbin_contains: geometry must be a POINT");
-        }
-
-        // Get the tile coordinates from the cell
-        int tile_x, tile_y, z;
-        quadbin::cell_to_tile(cell, tile_x, tile_y, z);
-
-        // Get the tile coordinates for the point at the same resolution
-        int point_tile_x, point_tile_y;
-        quadbin::lonlat_to_tile(lon, lat, z, point_tile_x, point_tile_y);
-
-        // Point is in tile if tile coordinates match
-        result_data[i] = (tile_x == point_tile_x && tile_y == point_tile_y);
-    }
-}
-
-// quadbin_intersects(cell, geometry) -> BOOLEAN
-// Check if a tile intersects a geometry (uses bounding box of geometry)
-// Uses DuckDB 1.5+ native GEOMETRY type
-static void QuadbinIntersectsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    args.data[0].Flatten(args.size());
-    args.data[1].Flatten(args.size());
-
-    auto cell_data = FlatVector::GetData<uint64_t>(args.data[0]);
-    auto geom_data = FlatVector::GetData<string_t>(args.data[1]);
-    auto result_data = FlatVector::GetData<bool>(result);
-    auto &result_mask = FlatVector::Validity(result);
-
-    for (idx_t i = 0; i < args.size(); i++) {
-        auto cell = cell_data[i];
-        auto geom = geom_data[i];
-
-        double query_min_lon, query_min_lat, query_max_lon, query_max_lat;
-        if (!ExtractBoundingBox(geom, query_min_lon, query_min_lat, query_max_lon, query_max_lat)) {
-            throw InvalidInputException("quadbin_intersects: could not extract bounding box from geometry");
-        }
-
-        // Get tile bbox
-        int tile_x, tile_y, z;
-        quadbin::cell_to_tile(cell, tile_x, tile_y, z);
-
-        double tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat;
-        quadbin::tile_to_bbox_wgs84(tile_x, tile_y, z, tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat);
-
-        // Check for intersection (two boxes intersect if they overlap in both dimensions)
-        bool intersects = !(tile_max_lon < query_min_lon ||  // tile is left of query
-                           tile_min_lon > query_max_lon ||  // tile is right of query
-                           tile_max_lat < query_min_lat ||  // tile is below query
-                           tile_min_lat > query_max_lat);   // tile is above query
-
-        result_data[i] = intersects;
-    }
-}
-
 // ============================================================================
 // PostGIS-like Spatial Predicate Functions
 // ============================================================================
@@ -536,49 +464,6 @@ static void STIntersectsFunction(DataChunk &args, ExpressionState &state, Vector
         }
 
         // Get tile bbox
-        int tile_x, tile_y, z;
-        quadbin::cell_to_tile(cell, tile_x, tile_y, z);
-
-        double tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat;
-        quadbin::tile_to_bbox_wgs84(tile_x, tile_y, z, tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat);
-
-        // Check for bbox intersection (fast O(1) comparison)
-        bool intersects = !(tile_max_lon < query_min_lon ||  // tile is left of query
-                           tile_min_lon > query_max_lon ||  // tile is right of query
-                           tile_max_lat < query_min_lat ||  // tile is below query
-                           tile_min_lat > query_max_lat);   // tile is above query
-
-        result_data[i] = intersects;
-    }
-}
-
-// ST_RasterIntersects(block, geometry) -> BOOLEAN
-// PostGIS-like API for raster tile intersection (alias for quadbin_intersects)
-// Semantics:
-//   - Block-level intersection only (tile/quadbin footprint, not pixel masking)
-//   - Operates in EPSG:4326 (quadbin space)
-//   - Input geometry is assumed to be in EPSG:4326
-//   - Returns TRUE if the tile's bounding box intersects the geometry's bbox
-// Note: This is the recommended function for WHERE clause filtering
-static void STRasterIntersectsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    args.data[0].Flatten(args.size());
-    args.data[1].Flatten(args.size());
-
-    auto cell_data = FlatVector::GetData<uint64_t>(args.data[0]);
-    auto geom_data = FlatVector::GetData<string_t>(args.data[1]);
-    auto result_data = FlatVector::GetData<bool>(result);
-
-    for (idx_t i = 0; i < args.size(); i++) {
-        auto cell = cell_data[i];
-        auto geom = geom_data[i];
-
-        double query_min_lon, query_min_lat, query_max_lon, query_max_lat;
-        if (!ExtractBoundingBox(geom, query_min_lon, query_min_lat, query_max_lon, query_max_lat)) {
-            throw InvalidInputException("ST_RasterIntersects: could not extract bounding box from geometry. "
-                                       "Geometry must be a POINT, POLYGON, or MULTIPOLYGON in EPSG:4326.");
-        }
-
-        // Get tile bbox in WGS84
         int tile_x, tile_y, z;
         quadbin::cell_to_tile(cell, tile_x, tile_y, z);
 
@@ -693,12 +578,6 @@ static void QuadbinToGeojsonFunction(DataChunk &args, ExpressionState &state, Ve
             auto json = cell_to_geojson(cell);
             return StringVector::AddString(result, json);
         });
-}
-
-// quadbin_boundary(cell) -> VARCHAR (alias for quadbin_to_wkt)
-// Returns WKT representation - named for PostGIS compatibility
-static void QuadbinBoundaryFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    QuadbinToWktFunction(args, state, result);
 }
 
 // ============================================================================
@@ -927,6 +806,111 @@ static void QuadbinKringFunction(DataChunk &args, ExpressionState &state, Vector
     ListVector::SetListSize(result, total_neighbors);
 }
 
+// ============================================================================
+// Basic Geometry Functions (avoid spatial extension dependency)
+// ============================================================================
+
+// ST_Point(lon, lat) -> GEOMETRY
+// Creates a WKB POINT geometry from lon/lat coordinates
+static void STPointFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    auto &lon_vec = args.data[0];
+    auto &lat_vec = args.data[1];
+    lon_vec.Flatten(args.size());
+    lat_vec.Flatten(args.size());
+
+    auto lon_data = FlatVector::GetData<double>(lon_vec);
+    auto lat_data = FlatVector::GetData<double>(lat_vec);
+    auto result_data = FlatVector::GetData<string_t>(result);
+
+    // WKB POINT format: byte_order(1) + type(4) + x(8) + y(8) = 21 bytes
+    uint8_t wkb[21];
+    wkb[0] = 1;  // Little-endian
+    uint32_t point_type = 1;  // POINT
+    memcpy(wkb + 1, &point_type, 4);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        double lon = lon_data[i];
+        double lat = lat_data[i];
+        memcpy(wkb + 5, &lon, 8);
+        memcpy(wkb + 13, &lat, 8);
+        result_data[i] = StringVector::AddStringOrBlob(result, reinterpret_cast<const char*>(wkb), 21);
+    }
+}
+
+// ST_X(geometry) -> DOUBLE
+// Returns the X coordinate (longitude) of a POINT geometry
+static void STXFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    auto &geom_vec = args.data[0];
+    geom_vec.Flatten(args.size());
+
+    auto geom_data = FlatVector::GetData<string_t>(geom_vec);
+    auto result_data = FlatVector::GetData<double>(result);
+    auto &result_mask = FlatVector::Validity(result);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        auto geom = geom_data[i];
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(geom.GetData());
+        idx_t size = geom.GetSize();
+
+        // Minimum size for WKB POINT: 21 bytes
+        if (size < 21) {
+            result_mask.SetInvalid(i);
+            continue;
+        }
+
+        // Check geometry type (bytes 1-4, assuming little-endian)
+        uint32_t geom_type;
+        memcpy(&geom_type, data + 1, 4);
+        uint32_t base_type = geom_type & 0xFF;
+
+        if (base_type != 1) {  // Not a POINT
+            result_mask.SetInvalid(i);
+            continue;
+        }
+
+        double x;
+        memcpy(&x, data + 5, 8);
+        result_data[i] = x;
+    }
+}
+
+// ST_Y(geometry) -> DOUBLE
+// Returns the Y coordinate (latitude) of a POINT geometry
+static void STYFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    auto &geom_vec = args.data[0];
+    geom_vec.Flatten(args.size());
+
+    auto geom_data = FlatVector::GetData<string_t>(geom_vec);
+    auto result_data = FlatVector::GetData<double>(result);
+    auto &result_mask = FlatVector::Validity(result);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        auto geom = geom_data[i];
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(geom.GetData());
+        idx_t size = geom.GetSize();
+
+        // Minimum size for WKB POINT: 21 bytes
+        if (size < 21) {
+            result_mask.SetInvalid(i);
+            continue;
+        }
+
+        // Check geometry type (bytes 1-4, assuming little-endian)
+        uint32_t geom_type;
+        memcpy(&geom_type, data + 1, 4);
+        uint32_t base_type = geom_type & 0xFF;
+
+        if (base_type != 1) {  // Not a POINT
+            result_mask.SetInvalid(i);
+            continue;
+        }
+
+        double y;
+        memcpy(&y, data + 13, 8);
+        result_data[i] = y;
+    }
+}
+
 void RegisterQuadbinFunctions(ExtensionLoader &loader) {
     // quadbin_from_tile(x, y, z) -> UBIGINT
     ScalarFunction from_tile("quadbin_from_tile",
@@ -1000,20 +984,6 @@ void RegisterQuadbinFunctions(ExtensionLoader &loader) {
     // Spatial Filtering Functions (uses DuckDB 1.5+ native GEOMETRY type)
     // ========================================================================
 
-    // quadbin_contains(cell, point_geometry) -> BOOLEAN
-    ScalarFunction contains("quadbin_contains",
-        {LogicalType::UBIGINT, LogicalType::GEOMETRY()},
-        LogicalType::BOOLEAN,
-        QuadbinContainsFunction);
-    loader.RegisterFunction(contains);
-
-    // quadbin_intersects(cell, geometry) -> BOOLEAN
-    ScalarFunction intersects("quadbin_intersects",
-        {LogicalType::UBIGINT, LogicalType::GEOMETRY()},
-        LogicalType::BOOLEAN,
-        QuadbinIntersectsFunction);
-    loader.RegisterFunction(intersects);
-
     // ========================================================================
     // PostGIS-like Spatial Predicate Functions
     // ========================================================================
@@ -1025,15 +995,6 @@ void RegisterQuadbinFunctions(ExtensionLoader &loader) {
         LogicalType::BOOLEAN,
         STIntersectsFunction);
     loader.RegisterFunction(st_intersects);
-
-    // ST_RasterIntersects(block, geometry) -> BOOLEAN
-    // PostGIS-like API specifically for raster tile filtering
-    // Recommended for WHERE clauses: WHERE ST_RasterIntersects(block, geom)
-    ScalarFunction st_raster_intersects("ST_RasterIntersects",
-        {LogicalType::UBIGINT, LogicalType::GEOMETRY()},
-        LogicalType::BOOLEAN,
-        STRasterIntersectsFunction);
-    loader.RegisterFunction(st_raster_intersects);
 
     // ST_Contains(geometry, block) -> BOOLEAN
     // PostGIS-like API: geometry contains tile
@@ -1062,14 +1023,6 @@ void RegisterQuadbinFunctions(ExtensionLoader &loader) {
         LogicalType::VARCHAR,
         QuadbinToGeojsonFunction);
     loader.RegisterFunction(to_geojson);
-
-    // quadbin_boundary(cell) -> VARCHAR
-    // Alias for quadbin_to_wkt - named for PostGIS compatibility
-    ScalarFunction boundary("quadbin_boundary",
-        {LogicalType::UBIGINT},
-        LogicalType::VARCHAR,
-        QuadbinBoundaryFunction);
-    loader.RegisterFunction(boundary);
 
     // ========================================================================
     // Hierarchical Functions (parent, children, siblings, kring)
@@ -1136,6 +1089,34 @@ void RegisterQuadbinFunctions(ExtensionLoader &loader) {
         LogicalType::GEOMETRY(),
         STGeomFromQuadbinFunction);
     loader.RegisterFunction(geom_from_quadbin);
+
+    // ========================================================================
+    // Basic Geometry Functions (avoid spatial extension dependency)
+    // ========================================================================
+
+    // ST_Point(lon, lat) -> GEOMETRY
+    // Creates a POINT geometry from lon/lat coordinates
+    ScalarFunction st_point("ST_Point",
+        {LogicalType::DOUBLE, LogicalType::DOUBLE},
+        LogicalType::GEOMETRY(),
+        STPointFunction);
+    loader.RegisterFunction(st_point);
+
+    // ST_X(geometry) -> DOUBLE
+    // Returns the X coordinate (longitude) of a POINT geometry
+    ScalarFunction st_x("ST_X",
+        {LogicalType::GEOMETRY()},
+        LogicalType::DOUBLE,
+        STXFunction);
+    loader.RegisterFunction(st_x);
+
+    // ST_Y(geometry) -> DOUBLE
+    // Returns the Y coordinate (latitude) of a POINT geometry
+    ScalarFunction st_y("ST_Y",
+        {LogicalType::GEOMETRY()},
+        LogicalType::DOUBLE,
+        STYFunction);
+    loader.RegisterFunction(st_y);
 }
 
 } // namespace duckdb

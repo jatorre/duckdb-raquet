@@ -224,14 +224,6 @@ static void STNormalizedDifferenceNodataFunction(DataChunk &args, ExpressionStat
 }
 
 // ============================================================================
-// ST_NDVI(nir_band, red_band, metadata) -> DOUBLE[]
-// Normalized Difference Vegetation Index = (NIR - Red) / (NIR + Red)
-// This is an alias for ST_NormalizedDifference with clearer semantics
-// ============================================================================
-
-// Uses same implementation as ST_NormalizedDifference
-
-// ============================================================================
 // ST_BandMath(band1, band2, operation, metadata) -> DOUBLE[]
 // Generic band math operations: 'add', 'subtract', 'multiply', 'divide', 'ndiff'
 // ============================================================================
@@ -479,13 +471,6 @@ void RegisterBandMathFunctions(ExtensionLoader &loader) {
         LogicalType::LIST(LogicalType::DOUBLE),
         STNormalizedDifferenceNodataFunction);
     loader.RegisterFunction(nd_nodata_fn);
-
-    // ST_NDVI - alias for vegetation index specifically
-    ScalarFunction ndvi_fn("ST_NDVI",
-        {LogicalType::BLOB, LogicalType::BLOB, LogicalType::VARCHAR},
-        LogicalType::LIST(LogicalType::DOUBLE),
-        STNormalizedDifferenceFunction);
-    loader.RegisterFunction(ndvi_fn);
 
     // ST_BandMath(band1, band2, operation, metadata) -> DOUBLE[]
     ScalarFunction bandmath_fn("ST_BandMath",

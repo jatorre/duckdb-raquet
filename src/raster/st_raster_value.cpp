@@ -373,7 +373,6 @@ static void STRasterValueWithGeometryFunction(DataChunk &args, ExpressionState &
         try {
             auto meta = raquet::parse_metadata(metadata_str);
             std::string dtype = meta.bands.empty() ? "uint8" : meta.bands[0].second;
-            bool compressed = (meta.compression == "gzip");
             int tile_size = meta.block_width;
 
             int resolution = quadbin::cell_to_resolution(block);
@@ -389,11 +388,25 @@ static void STRasterValueWithGeometryFunction(DataChunk &args, ExpressionState &
                 continue;
             }
 
-            double value = raquet::decode_pixel(
-                reinterpret_cast<const uint8_t*>(band.GetData()),
-                band.GetSize(),
-                dtype, pixel_x, pixel_y, tile_size, compressed
-            );
+            double value;
+            if (meta.is_interleaved()) {
+                // v0.4.0 interleaved layout: all bands in single column
+                value = raquet::decode_pixel_interleaved(
+                    reinterpret_cast<const uint8_t*>(band.GetData()),
+                    band.GetSize(),
+                    dtype, pixel_x, pixel_y, tile_size,
+                    0, meta.num_bands(),
+                    meta.compression
+                );
+            } else {
+                // Standard sequential layout
+                bool compressed = (meta.compression == "gzip");
+                value = raquet::decode_pixel(
+                    reinterpret_cast<const uint8_t*>(band.GetData()),
+                    band.GetSize(),
+                    dtype, pixel_x, pixel_y, tile_size, compressed
+                );
+            }
 
             // Check for NODATA value and return NULL if matched
             if (!meta.band_info.empty() && meta.is_nodata(0, value)) {
@@ -410,6 +423,7 @@ static void STRasterValueWithGeometryFunction(DataChunk &args, ExpressionState &
 
 // ST_RasterValue(block UBIGINT, band BLOB, point GEOMETRY, metadata VARCHAR, band_index INT) -> DOUBLE
 // Get pixel value at point geometry with explicit band index (for multi-band rasters)
+// Auto-detects interleaved vs sequential layout from metadata
 static void STRasterValueWithGeometryAndBandFunction(DataChunk &args, ExpressionState &state, Vector &result) {
     args.data[0].Flatten(args.size());
     args.data[1].Flatten(args.size());
@@ -446,7 +460,6 @@ static void STRasterValueWithGeometryAndBandFunction(DataChunk &args, Expression
         try {
             auto meta = raquet::parse_metadata(metadata_str);
             std::string dtype = meta.get_band_type(band_idx);
-            bool compressed = (meta.compression == "gzip");
             int tile_size = meta.block_width;
 
             int resolution = quadbin::cell_to_resolution(block);
@@ -462,11 +475,25 @@ static void STRasterValueWithGeometryAndBandFunction(DataChunk &args, Expression
                 continue;
             }
 
-            double value = raquet::decode_pixel(
-                reinterpret_cast<const uint8_t*>(band.GetData()),
-                band.GetSize(),
-                dtype, pixel_x, pixel_y, tile_size, compressed
-            );
+            double value;
+            if (meta.is_interleaved()) {
+                // v0.4.0 interleaved layout: all bands in single column
+                value = raquet::decode_pixel_interleaved(
+                    reinterpret_cast<const uint8_t*>(band.GetData()),
+                    band.GetSize(),
+                    dtype, pixel_x, pixel_y, tile_size,
+                    band_idx, meta.num_bands(),
+                    meta.compression
+                );
+            } else {
+                // Standard sequential layout
+                bool compressed = (meta.compression == "gzip");
+                value = raquet::decode_pixel(
+                    reinterpret_cast<const uint8_t*>(band.GetData()),
+                    band.GetSize(),
+                    dtype, pixel_x, pixel_y, tile_size, compressed
+                );
+            }
 
             // Check for NODATA value and return NULL if matched
             if (band_idx < static_cast<int32_t>(meta.band_info.size()) && meta.is_nodata(band_idx, value)) {
@@ -482,7 +509,7 @@ static void STRasterValueWithGeometryAndBandFunction(DataChunk &args, Expression
 }
 
 // ============================================================================
-// v0.4.0: Interleaved layout support
+// v0.4.0: Interleaved layout low-level pixel access
 // ============================================================================
 
 // raquet_pixel_interleaved(pixels BLOB, metadata VARCHAR, band_index INT, x INT, y INT) -> DOUBLE
@@ -523,8 +550,6 @@ static void RaquetPixelInterleavedFunction(DataChunk &args, ExpressionState &sta
 
         try {
             auto meta = raquet::parse_metadata(metadata_str);
-
-            // Get dtype from band info
             std::string dtype = meta.get_band_type(band_idx);
             int num_bands = meta.num_bands();
 
@@ -536,7 +561,6 @@ static void RaquetPixelInterleavedFunction(DataChunk &args, ExpressionState &sta
                 meta.compression
             );
 
-            // Check for NODATA value
             if (meta.is_nodata(band_idx, value)) {
                 result_mask.SetInvalid(i);
                 continue;
@@ -545,81 +569,6 @@ static void RaquetPixelInterleavedFunction(DataChunk &args, ExpressionState &sta
             result_data[i] = value;
         } catch (const std::exception &e) {
             throw InvalidInputException("raquet_pixel_interleaved error: %s", e.what());
-        }
-    }
-}
-
-// ST_RasterValue for interleaved layout
-// ST_RasterValue(block UBIGINT, pixels BLOB, point GEOMETRY, metadata VARCHAR, band_index INT) -> DOUBLE
-static void STRasterValueInterleavedFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    args.data[0].Flatten(args.size());
-    args.data[1].Flatten(args.size());
-    args.data[2].Flatten(args.size());
-    args.data[3].Flatten(args.size());
-    args.data[4].Flatten(args.size());
-
-    auto block_data = FlatVector::GetData<uint64_t>(args.data[0]);
-    auto pixels_data = FlatVector::GetData<string_t>(args.data[1]);
-    auto geom_data = FlatVector::GetData<string_t>(args.data[2]);
-    auto metadata_data = FlatVector::GetData<string_t>(args.data[3]);
-    auto band_idx_data = FlatVector::GetData<int32_t>(args.data[4]);
-    auto result_data = FlatVector::GetData<double>(result);
-    auto &result_mask = FlatVector::Validity(result);
-
-    for (idx_t i = 0; i < args.size(); i++) {
-        auto block = block_data[i];
-        auto pixels = pixels_data[i];
-        auto geom = geom_data[i];
-        auto metadata_str = metadata_data[i].GetString();
-        auto band_idx = band_idx_data[i];
-
-        if (pixels.GetSize() == 0 || band_idx < 0) {
-            result_mask.SetInvalid(i);
-            continue;
-        }
-
-        // Extract lon/lat from point geometry (assumed EPSG:4326)
-        double lon, lat;
-        if (!ExtractPointCoordinates(geom, lon, lat)) {
-            throw InvalidInputException("ST_RasterValue: geometry must be a POINT in EPSG:4326");
-        }
-
-        try {
-            auto meta = raquet::parse_metadata(metadata_str);
-            std::string dtype = meta.get_band_type(band_idx);
-            int num_bands = meta.num_bands();
-            int tile_size = meta.block_width;
-
-            int resolution = quadbin::cell_to_resolution(block);
-            int tile_x, tile_y, z;
-            quadbin::cell_to_tile(block, tile_x, tile_y, z);
-
-            int pixel_x, pixel_y, calc_tile_x, calc_tile_y;
-            quadbin::lonlat_to_pixel(lon, lat, resolution, tile_size, pixel_x, pixel_y, calc_tile_x, calc_tile_y);
-
-            // Return NULL if point falls outside this block
-            if (calc_tile_x != tile_x || calc_tile_y != tile_y) {
-                result_mask.SetInvalid(i);
-                continue;
-            }
-
-            double value = raquet::decode_pixel_interleaved(
-                reinterpret_cast<const uint8_t*>(pixels.GetData()),
-                pixels.GetSize(),
-                dtype, pixel_x, pixel_y, tile_size,
-                band_idx, num_bands,
-                meta.compression
-            );
-
-            // Check for NODATA value
-            if (meta.is_nodata(band_idx, value)) {
-                result_mask.SetInvalid(i);
-                continue;
-            }
-
-            result_data[i] = value;
-        } catch (const std::exception &e) {
-            throw InvalidInputException("ST_RasterValue error: %s", e.what());
         }
     }
 }
@@ -681,7 +630,7 @@ void RegisterRasterValueFunctions(ExtensionLoader &loader) {
     loader.RegisterFunction(raster_value_geom_band_fn);
 
     // ========================================================================
-    // v0.4.0: Interleaved layout functions
+    // v0.4.0: Interleaved layout low-level function
     // ========================================================================
 
     // raquet_pixel_interleaved(pixels, metadata, band_index, x, y) -> DOUBLE
@@ -691,14 +640,6 @@ void RegisterRasterValueFunctions(ExtensionLoader &loader) {
         LogicalType::DOUBLE,
         RaquetPixelInterleavedFunction);
     loader.RegisterFunction(pixel_interleaved_fn);
-
-    // ST_RasterValueInterleaved(block, pixels, point_geometry, metadata, band_index) -> DOUBLE
-    ScalarFunction raster_value_interleaved_fn("ST_RasterValueInterleaved",
-        {LogicalType::UBIGINT, LogicalType::BLOB, LogicalType::GEOMETRY(),
-         LogicalType::VARCHAR, LogicalType::INTEGER},
-        LogicalType::DOUBLE,
-        STRasterValueInterleavedFunction);
-    loader.RegisterFunction(raster_value_interleaved_fn);
 }
 
 } // namespace duckdb

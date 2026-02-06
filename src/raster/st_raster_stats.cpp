@@ -3,6 +3,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "band_decoder.hpp"
+#include "raquet_metadata.hpp"
 #include "quadbin.hpp"
 #include <cmath>
 
@@ -170,6 +171,141 @@ static void STRasterSummaryStatsSimpleFunction(DataChunk &args, ExpressionState 
     result.SetVectorType(VectorType::FLAT_VECTOR);
 }
 
+// ============================================================================
+// Metadata-aware overloads
+// ============================================================================
+
+// ST_RasterSummaryStats(band BLOB, metadata VARCHAR) -> STRUCT
+// Extracts dtype, dimensions, compression, and nodata from metadata automatically
+static void STRasterSummaryStatsMetadataFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    args.data[0].Flatten(args.size());
+    args.data[1].Flatten(args.size());
+
+    auto band_data = FlatVector::GetData<string_t>(args.data[0]);
+    auto metadata_data = FlatVector::GetData<string_t>(args.data[1]);
+
+    auto &band_validity = FlatVector::Validity(args.data[0]);
+
+    auto &struct_entries = StructVector::GetEntries(result);
+    auto count_data = FlatVector::GetData<int64_t>(*struct_entries[0]);
+    auto sum_data = FlatVector::GetData<double>(*struct_entries[1]);
+    auto mean_data = FlatVector::GetData<double>(*struct_entries[2]);
+    auto min_data = FlatVector::GetData<double>(*struct_entries[3]);
+    auto max_data = FlatVector::GetData<double>(*struct_entries[4]);
+    auto stddev_data = FlatVector::GetData<double>(*struct_entries[5]);
+
+    auto &result_validity = FlatVector::Validity(result);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        if (!band_validity.RowIsValid(i)) {
+            result_validity.SetInvalid(i);
+            continue;
+        }
+
+        auto band = band_data[i];
+        if (band.GetSize() == 0) {
+            result_validity.SetInvalid(i);
+            continue;
+        }
+
+        try {
+            auto meta = raquet::parse_metadata(metadata_data[i].GetString());
+            std::string dtype = meta.bands.empty() ? "uint8" : meta.bands[0].second;
+            bool compressed = (meta.compression == "gzip");
+
+            // Check for nodata from band_info
+            bool has_nodata = !meta.band_info.empty() && meta.band_info[0].has_nodata;
+            double nodata = has_nodata ? meta.band_info[0].nodata : 0.0;
+
+            auto stats = raquet::compute_band_stats(
+                reinterpret_cast<const uint8_t*>(band.GetData()),
+                band.GetSize(),
+                dtype, meta.block_width, meta.block_height, compressed,
+                has_nodata, nodata
+            );
+
+            count_data[i] = stats.count;
+            sum_data[i] = stats.sum;
+            mean_data[i] = stats.mean;
+            min_data[i] = stats.min;
+            max_data[i] = stats.max;
+            stddev_data[i] = stats.stddev;
+        } catch (const std::exception &e) {
+            result_validity.SetInvalid(i);
+        }
+    }
+
+    result.SetVectorType(VectorType::FLAT_VECTOR);
+}
+
+// ST_RasterSummaryStats(band BLOB, metadata VARCHAR, band_index INT) -> STRUCT
+// Multi-band variant: uses band_index to get the correct dtype and nodata
+static void STRasterSummaryStatsMetadataBandFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    args.data[0].Flatten(args.size());
+    args.data[1].Flatten(args.size());
+    args.data[2].Flatten(args.size());
+
+    auto band_data = FlatVector::GetData<string_t>(args.data[0]);
+    auto metadata_data = FlatVector::GetData<string_t>(args.data[1]);
+    auto band_idx_data = FlatVector::GetData<int32_t>(args.data[2]);
+
+    auto &band_validity = FlatVector::Validity(args.data[0]);
+
+    auto &struct_entries = StructVector::GetEntries(result);
+    auto count_data = FlatVector::GetData<int64_t>(*struct_entries[0]);
+    auto sum_data = FlatVector::GetData<double>(*struct_entries[1]);
+    auto mean_data = FlatVector::GetData<double>(*struct_entries[2]);
+    auto min_data = FlatVector::GetData<double>(*struct_entries[3]);
+    auto max_data = FlatVector::GetData<double>(*struct_entries[4]);
+    auto stddev_data = FlatVector::GetData<double>(*struct_entries[5]);
+
+    auto &result_validity = FlatVector::Validity(result);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        if (!band_validity.RowIsValid(i)) {
+            result_validity.SetInvalid(i);
+            continue;
+        }
+
+        auto band = band_data[i];
+        auto band_idx = band_idx_data[i];
+
+        if (band.GetSize() == 0 || band_idx < 0) {
+            result_validity.SetInvalid(i);
+            continue;
+        }
+
+        try {
+            auto meta = raquet::parse_metadata(metadata_data[i].GetString());
+            std::string dtype = meta.get_band_type(band_idx);
+            bool compressed = (meta.compression == "gzip");
+
+            // Check for nodata from band_info
+            bool has_nodata = band_idx < static_cast<int32_t>(meta.band_info.size()) &&
+                              meta.band_info[band_idx].has_nodata;
+            double nodata = has_nodata ? meta.band_info[band_idx].nodata : 0.0;
+
+            auto stats = raquet::compute_band_stats(
+                reinterpret_cast<const uint8_t*>(band.GetData()),
+                band.GetSize(),
+                dtype, meta.block_width, meta.block_height, compressed,
+                has_nodata, nodata
+            );
+
+            count_data[i] = stats.count;
+            sum_data[i] = stats.sum;
+            mean_data[i] = stats.mean;
+            min_data[i] = stats.min;
+            max_data[i] = stats.max;
+            stddev_data[i] = stats.stddev;
+        } catch (const std::exception &e) {
+            result_validity.SetInvalid(i);
+        }
+    }
+
+    result.SetVectorType(VectorType::FLAT_VECTOR);
+}
+
 void RegisterRasterStatsFunctions(ExtensionLoader &loader) {
     // Define the stats struct type
     child_list_t<LogicalType> stats_struct;
@@ -196,6 +332,22 @@ void RegisterRasterStatsFunctions(ExtensionLoader &loader) {
         stats_type,
         STRasterSummaryStatsSimpleFunction);
     loader.RegisterFunction(stats_simple_fn);
+
+    // ST_RasterSummaryStats(band, metadata) -> STRUCT
+    // Metadata-aware: extracts dtype, dimensions, compression, nodata automatically
+    ScalarFunction stats_meta_fn("ST_RasterSummaryStats",
+        {LogicalType::BLOB, LogicalType::VARCHAR},
+        stats_type,
+        STRasterSummaryStatsMetadataFunction);
+    loader.RegisterFunction(stats_meta_fn);
+
+    // ST_RasterSummaryStats(band, metadata, band_index) -> STRUCT
+    // Multi-band metadata-aware variant
+    ScalarFunction stats_meta_band_fn("ST_RasterSummaryStats",
+        {LogicalType::BLOB, LogicalType::VARCHAR, LogicalType::INTEGER},
+        stats_type,
+        STRasterSummaryStatsMetadataBandFunction);
+    loader.RegisterFunction(stats_meta_band_fn);
 }
 
 } // namespace duckdb

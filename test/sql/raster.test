@@ -117,42 +117,6 @@ statement ok
 DROP TABLE test_decode
 
 # =============================================================================
-# Test metadata helper functions
-# =============================================================================
-
-# Test raquet_is_metadata_row
-query I
-SELECT raquet_is_metadata_row(0::UBIGINT)
-----
-true
-
-query I
-SELECT raquet_is_metadata_row(123::UBIGINT)
-----
-false
-
-query I
-SELECT raquet_is_metadata_row(5234261499580514304::UBIGINT)
-----
-false
-
-# Test raquet_is_data_row
-query I
-SELECT raquet_is_data_row(0::UBIGINT)
-----
-false
-
-query I
-SELECT raquet_is_data_row(123::UBIGINT)
-----
-true
-
-query I
-SELECT raquet_is_data_row(5234261499580514304::UBIGINT)
-----
-true
-
-# =============================================================================
 # Test ST_RasterSummaryStats structure
 # =============================================================================
 
@@ -179,21 +143,44 @@ statement ok
 DROP TABLE test_stats
 
 # =============================================================================
+# Test metadata-aware ST_RasterSummaryStats
+# =============================================================================
+
+statement ok
+CREATE TABLE test_stats_meta AS
+SELECT
+    1::UBIGINT as block,
+    '\x0A\x14\x1E\x28'::BLOB as band_1,
+    '{"file_format":"raquet","compression":"none","tiling":{"block_width":2,"block_height":2},"bands":[{"name":"band_1","type":"uint8"}]}'::VARCHAR as metadata
+
+# ST_RasterSummaryStats(band, metadata) should give same results as explicit version
+query IIIIII
+SELECT
+    (ST_RasterSummaryStats(band_1, metadata)).count,
+    (ST_RasterSummaryStats(band_1, metadata)).sum,
+    (ST_RasterSummaryStats(band_1, metadata)).mean,
+    (ST_RasterSummaryStats(band_1, metadata)).min,
+    (ST_RasterSummaryStats(band_1, metadata)).max,
+    round((ST_RasterSummaryStats(band_1, metadata)).stddev, 4)
+FROM test_stats_meta
+----
+4	100.0	25.0	10.0	40.0	12.9099
+
+# ST_RasterSummaryStats(band, metadata, band_index) should also work
+query I
+SELECT (ST_RasterSummaryStats(band_1, metadata, 0)).count FROM test_stats_meta
+----
+4
+
+statement ok
+DROP TABLE test_stats_meta
+
+# =============================================================================
 # Test null handling
 # =============================================================================
 
 query I
 SELECT raquet_pixel(NULL, 'uint8', 0, 0, 4, 'none')
-----
-NULL
-
-query I
-SELECT raquet_is_metadata_row(NULL)
-----
-NULL
-
-query I
-SELECT raquet_is_data_row(NULL)
 ----
 NULL
 
@@ -233,7 +220,7 @@ statement ok
 DROP TABLE test_meta
 
 # =============================================================================
-# Note: ST_RasterValue and quadbin_contains/quadbin_intersects use
+# Note: ST_RasterValue and spatial predicate functions use
 # DuckDB 1.5+ native GEOMETRY types. Create geometries using WKT cast:
 #   'POINT(-3.7 40.4)'::GEOMETRY
 # =============================================================================

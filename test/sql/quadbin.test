@@ -190,24 +190,10 @@ SELECT quadbin_to_geojson(quadbin_from_tile(0, 0, 0)) LIKE '{"type":"Polygon"%';
 ----
 true
 
-# Test quadbin_boundary (alias for quadbin_to_wkt)
-query I
-SELECT quadbin_boundary(quadbin_from_tile(0, 0, 0)) = quadbin_to_wkt(quadbin_from_tile(0, 0, 0));
-----
-true
-
 # =============================================================================
 # Test spatial filtering functions
 # Note: These functions use DuckDB 1.5+ native GEOMETRY types.
 # Create geometries using WKT cast: 'POINT(-3.7 40.4)'::GEOMETRY
-#
-# Example usage:
-#   -- Low-level quadbin functions:
-#   SELECT quadbin_contains(cell, 'POINT(-73.9857 40.7484)'::GEOMETRY);
-#   SELECT quadbin_intersects(cell, 'POLYGON((-74.0 40.7, -73.9 40.7, -73.9 40.8, -74.0 40.8, -74.0 40.7))'::GEOMETRY);
-#
-#   -- PostGIS-like API (recommended for users):
-#   SELECT ST_RasterIntersects(block, 'POLYGON((-74 40.7, -73.9 40.7, -73.9 40.8, -74 40.8, -74 40.7))'::GEOMETRY);
 #
 # Example usage with raquet files:
 #   SELECT ST_RegionStats(band_1, block, region_geom, metadata) as stats

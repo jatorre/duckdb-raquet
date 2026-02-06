@@ -73,91 +73,6 @@ static void RaquetParseMetadataFunction(DataChunk &args, ExpressionState &state,
     result.SetVectorType(VectorType::FLAT_VECTOR);
 }
 
-// raquet_band_type(metadata_json VARCHAR, band_index INT) -> VARCHAR
-// Get the data type for a specific band
-static void RaquetBandTypeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    args.data[0].Flatten(args.size());
-    args.data[1].Flatten(args.size());
-
-    auto metadata_data = FlatVector::GetData<string_t>(args.data[0]);
-    auto band_idx_data = FlatVector::GetData<int32_t>(args.data[1]);
-    auto result_data = FlatVector::GetData<string_t>(result);
-    auto &result_mask = FlatVector::Validity(result);
-
-    for (idx_t i = 0; i < args.size(); i++) {
-        auto metadata_str = metadata_data[i].GetString();
-        auto band_idx = band_idx_data[i];
-
-        if (metadata_str.empty() || band_idx < 0) {
-            result_mask.SetInvalid(i);
-            continue;
-        }
-
-        try {
-            auto meta = raquet::parse_metadata(metadata_str);
-            if (band_idx >= static_cast<int32_t>(meta.bands.size())) {
-                result_mask.SetInvalid(i);
-                continue;
-            }
-            result_data[i] = StringVector::AddString(result, meta.bands[band_idx].second);
-        } catch (...) {
-            result_mask.SetInvalid(i);
-        }
-    }
-}
-
-// raquet_compression(metadata_json VARCHAR) -> VARCHAR
-// Get the compression type from metadata
-static void RaquetCompressionFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    args.data[0].Flatten(args.size());
-
-    auto metadata_data = FlatVector::GetData<string_t>(args.data[0]);
-    auto result_data = FlatVector::GetData<string_t>(result);
-    auto &result_mask = FlatVector::Validity(result);
-
-    for (idx_t i = 0; i < args.size(); i++) {
-        auto metadata_str = metadata_data[i].GetString();
-
-        if (metadata_str.empty()) {
-            result_mask.SetInvalid(i);
-            continue;
-        }
-
-        try {
-            auto meta = raquet::parse_metadata(metadata_str);
-            result_data[i] = StringVector::AddString(result, meta.compression);
-        } catch (...) {
-            result_mask.SetInvalid(i);
-        }
-    }
-}
-
-// raquet_block_size(metadata_json VARCHAR) -> INT
-// Get the block size from metadata
-static void RaquetBlockSizeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    args.data[0].Flatten(args.size());
-
-    auto metadata_data = FlatVector::GetData<string_t>(args.data[0]);
-    auto result_data = FlatVector::GetData<int32_t>(result);
-    auto &result_mask = FlatVector::Validity(result);
-
-    for (idx_t i = 0; i < args.size(); i++) {
-        auto metadata_str = metadata_data[i].GetString();
-
-        if (metadata_str.empty()) {
-            result_mask.SetInvalid(i);
-            continue;
-        }
-
-        try {
-            auto meta = raquet::parse_metadata(metadata_str);
-            result_data[i] = meta.block_width;
-        } catch (...) {
-            result_mask.SetInvalid(i);
-        }
-    }
-}
-
 void RegisterRaquetTableFunctions(ExtensionLoader &loader) {
     // Note: read_raquet() table macro is registered in raquet_extension.cpp
 
@@ -187,26 +102,6 @@ void RegisterRaquetTableFunctions(ExtensionLoader &loader) {
         RaquetParseMetadataFunction);
     loader.RegisterFunction(parse_metadata_fn);
 
-    // raquet_band_type(metadata, band_index) -> VARCHAR
-    ScalarFunction band_type_fn("raquet_band_type",
-        {LogicalType::VARCHAR, LogicalType::INTEGER},
-        LogicalType::VARCHAR,
-        RaquetBandTypeFunction);
-    loader.RegisterFunction(band_type_fn);
-
-    // raquet_compression(metadata) -> VARCHAR
-    ScalarFunction compression_fn("raquet_compression",
-        {LogicalType::VARCHAR},
-        LogicalType::VARCHAR,
-        RaquetCompressionFunction);
-    loader.RegisterFunction(compression_fn);
-
-    // raquet_block_size(metadata) -> INT
-    ScalarFunction block_size_fn("raquet_block_size",
-        {LogicalType::VARCHAR},
-        LogicalType::INTEGER,
-        RaquetBlockSizeFunction);
-    loader.RegisterFunction(block_size_fn);
 }
 
 } // namespace duckdb
