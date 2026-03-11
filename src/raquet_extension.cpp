@@ -33,7 +33,7 @@ static const DefaultTableMacro RAQUET_TABLE_MACROS[] = {
      R"(
         WITH src AS (SELECT * FROM read_parquet(file))
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block != 0
@@ -49,7 +49,7 @@ static const DefaultTableMacro RAQUET_TABLE_MACROS[] = {
             WHERE block != 0
         )
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block IN (
@@ -63,7 +63,7 @@ static const DefaultTableMacro RAQUET_TABLE_MACROS[] = {
      R"(
         WITH src AS (SELECT * FROM read_parquet(file))
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block IN (SELECT UNNEST(QUADBIN_POLYFILL(geometry, resolution, 'intersects')))
@@ -85,6 +85,7 @@ static const DefaultTableMacro RAQUET_METADATA_TABLE_MACRO = {
         SELECT metadata
         FROM read_parquet(file)
         WHERE block = 0
+        LIMIT 1
      )"
 };
 
@@ -98,7 +99,7 @@ static const DefaultTableMacro RAQUET_FROM_TABLE_MACROS[] = {
      R"(
         WITH src AS (SELECT * FROM query_table(tbl))
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block != 0
@@ -114,7 +115,7 @@ static const DefaultTableMacro RAQUET_FROM_TABLE_MACROS[] = {
             WHERE block != 0
         )
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block::UBIGINT IN (
@@ -128,7 +129,7 @@ static const DefaultTableMacro RAQUET_FROM_TABLE_MACROS[] = {
      R"(
         WITH src AS (SELECT * FROM query_table(tbl))
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block::UBIGINT IN (SELECT UNNEST(QUADBIN_POLYFILL(geometry, resolution, 'intersects')))
@@ -153,7 +154,7 @@ static const DefaultTableMacro RAQUET_TABLE_AT_MACROS[] = {
             WHERE block != 0
         )
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block::UBIGINT = quadbin_from_lonlat(ST_X(point), ST_Y(point), (SELECT res FROM table_resolution))
@@ -169,7 +170,7 @@ static const DefaultTableMacro RAQUET_TABLE_AT_MACROS[] = {
             WHERE block != 0
         )
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block::UBIGINT = quadbin_from_lonlat(lon, lat, (SELECT res FROM table_resolution))
@@ -180,7 +181,7 @@ static const DefaultTableMacro RAQUET_TABLE_AT_MACROS[] = {
      R"(
         WITH src AS (SELECT * FROM query_table(tbl))
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block::UBIGINT = quadbin_from_lonlat(lon, lat, resolution)
@@ -206,7 +207,7 @@ static const DefaultTableMacro RAQUET_AT_TABLE_MACROS[] = {
             WHERE block != 0
         )
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block = quadbin_from_lonlat(ST_X(point), ST_Y(point), (SELECT res FROM file_resolution))
@@ -223,7 +224,7 @@ static const DefaultTableMacro RAQUET_AT_TABLE_MACROS[] = {
             WHERE block != 0
         )
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block = quadbin_from_lonlat(lon, lat, (SELECT res FROM file_resolution))
@@ -235,7 +236,7 @@ static const DefaultTableMacro RAQUET_AT_TABLE_MACROS[] = {
      R"(
         WITH src AS (SELECT * FROM read_parquet(file))
         SELECT * REPLACE (
-            (SELECT metadata FROM src WHERE block = 0) AS metadata
+            (SELECT metadata FROM src WHERE block = 0 LIMIT 1) AS metadata
         )
         FROM src
         WHERE block = quadbin_from_lonlat(lon, lat, resolution)
