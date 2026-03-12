@@ -304,6 +304,50 @@ static void STRasterSummaryStatsMetadataNodataFunction(DataChunk &args, Expressi
     result.SetVectorType(VectorType::FLAT_VECTOR);
 }
 
+// ============================================================================
+// Pre-computed tile statistics passthrough (v0.5.0)
+// ============================================================================
+
+// ST_RasterSummaryStats(count BIGINT, sum DOUBLE, mean DOUBLE, min DOUBLE, max DOUBLE, stddev DOUBLE) -> STRUCT
+// Passthrough for pre-computed tile statistics columns - no decompression needed
+static void STRasterSummaryStatsPrecomputedFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    for (idx_t v = 0; v < 6; v++) {
+        args.data[v].Flatten(args.size());
+    }
+
+    auto in_count = FlatVector::GetData<int64_t>(args.data[0]);
+    auto in_sum = FlatVector::GetData<double>(args.data[1]);
+    auto in_mean = FlatVector::GetData<double>(args.data[2]);
+    auto in_min = FlatVector::GetData<double>(args.data[3]);
+    auto in_max = FlatVector::GetData<double>(args.data[4]);
+    auto in_stddev = FlatVector::GetData<double>(args.data[5]);
+    auto &count_validity = FlatVector::Validity(args.data[0]);
+
+    auto &struct_entries = StructVector::GetEntries(result);
+    auto out_count = FlatVector::GetData<int64_t>(*struct_entries[0]);
+    auto out_sum = FlatVector::GetData<double>(*struct_entries[1]);
+    auto out_mean = FlatVector::GetData<double>(*struct_entries[2]);
+    auto out_min = FlatVector::GetData<double>(*struct_entries[3]);
+    auto out_max = FlatVector::GetData<double>(*struct_entries[4]);
+    auto out_stddev = FlatVector::GetData<double>(*struct_entries[5]);
+    auto &result_validity = FlatVector::Validity(result);
+
+    for (idx_t i = 0; i < args.size(); i++) {
+        if (!count_validity.RowIsValid(i)) {
+            result_validity.SetInvalid(i);
+            continue;
+        }
+        out_count[i] = in_count[i];
+        out_sum[i] = in_sum[i];
+        out_mean[i] = in_mean[i];
+        out_min[i] = in_min[i];
+        out_max[i] = in_max[i];
+        out_stddev[i] = in_stddev[i];
+    }
+
+    result.SetVectorType(VectorType::FLAT_VECTOR);
+}
+
 void RegisterRasterStatsFunctions(ExtensionLoader &loader) {
     // Define the stats struct type
     child_list_t<LogicalType> stats_struct;
@@ -346,6 +390,15 @@ void RegisterRasterStatsFunctions(ExtensionLoader &loader) {
         stats_type,
         STRasterSummaryStatsMetadataNodataFunction);
     loader.RegisterFunction(stats_meta_nodata_fn);
+
+    // v0.5.0: ST_RasterSummaryStats(count, sum, mean, min, max, stddev) -> STRUCT
+    // Passthrough for pre-computed tile statistics columns (no decompression)
+    ScalarFunction stats_precomputed_fn("ST_RasterSummaryStats",
+        {LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::DOUBLE,
+         LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE},
+        stats_type,
+        STRasterSummaryStatsPrecomputedFunction);
+    loader.RegisterFunction(stats_precomputed_fn);
 }
 
 } // namespace duckdb

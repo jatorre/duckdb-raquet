@@ -37,6 +37,8 @@ struct RaquetMetadata {
     int num_blocks;
     std::string scheme; // "quadbin"
     std::string crs;    // "EPSG:3857"
+    bool tile_statistics;              // v0.5.0: pre-computed per-tile stats
+    std::vector<std::string> tile_statistics_columns; // v0.5.0: which stats are available
     std::vector<BandInfo> band_info;  // Full band info including nodata
     std::vector<std::pair<std::string, std::string>> bands;  // name -> type (for backward compat)
 
@@ -90,6 +92,11 @@ struct RaquetMetadata {
     // v0.4.0: Check if band layout is interleaved
     bool is_interleaved() const {
         return band_layout == "interleaved";
+    }
+
+    // v0.5.0: Check if tile statistics are available
+    bool has_tile_statistics() const {
+        return tile_statistics;
     }
 
     // v0.4.0: Check if compression is lossy (JPEG/WebP)
@@ -190,6 +197,36 @@ inline double parse_nodata_value(const std::string &val) {
     } catch (...) {
         return 0.0;
     }
+}
+
+// Extract a JSON array of strings: "key": ["a", "b", "c"]
+inline std::vector<std::string> extract_json_string_array(const std::string &json, const std::string &key) {
+    std::vector<std::string> result;
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return result;
+    pos += search.length();
+
+    // Skip whitespace
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n')) {
+        pos++;
+    }
+    if (pos >= json.size() || json[pos] != '[') return result;
+
+    size_t arr_end = json.find(']', pos);
+    if (arr_end == std::string::npos) return result;
+
+    std::string arr = json.substr(pos + 1, arr_end - pos - 1);
+    size_t p = 0;
+    while (p < arr.size()) {
+        size_t q_start = arr.find('"', p);
+        if (q_start == std::string::npos) break;
+        size_t q_end = arr.find('"', q_start + 1);
+        if (q_end == std::string::npos) break;
+        result.push_back(arr.substr(q_start + 1, q_end - q_start - 1));
+        p = q_end + 1;
+    }
+    return result;
 }
 
 // Extract a nested JSON object as a string
@@ -318,6 +355,11 @@ inline RaquetMetadata parse_metadata(const std::string &json) {
     }
 
     parse_bands_full(json, meta.bands, meta.band_info);
+
+    // v0.5.0: tile statistics
+    std::string tile_stats_val = extract_json_string(json, "tile_statistics");
+    meta.tile_statistics = (tile_stats_val == "true" || tile_stats_val == "1");
+    meta.tile_statistics_columns = extract_json_string_array(json, "tile_statistics_columns");
 
     return meta;
 }
