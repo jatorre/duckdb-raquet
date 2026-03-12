@@ -2,9 +2,6 @@
 build/
 cmake-build-*/
 
-# DuckDB source (submodule or clone)
-duckdb/
-
 # IDE
 .idea/
 .vscode/
@@ -25,3 +22,4 @@ Thumbs.db
 
 # Test artifacts
 *.log
+duckdb_unittest_tempdir/
