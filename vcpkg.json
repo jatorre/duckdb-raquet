@@ -2,7 +2,10 @@
   "dependencies": [
     "vcpkg-cmake",
     "openssl",
-    "curl"
+    "curl",
+    "zlib",
+    "libjpeg-turbo",
+    "libwebp"
   ],
   "vcpkg-configuration": {
     "overlay-ports": [
