@@ -21,6 +21,7 @@ set(EXTENSION_SOURCES
     src/quadbin/quadbin_functions.cpp
     src/quadbin/quadbin_polyfill.cpp
     src/raster/band_decoder.cpp
+    src/raster/band_encoder.cpp
     src/raster/st_raster_value.cpp
     src/raster/st_raster_stats.cpp
     src/raster/st_region_stats.cpp
@@ -49,6 +50,15 @@ else()
     message(STATUS "WebP support disabled (libwebp not found)")
 endif()
 
+# Optional: Find GDAL for raster ingestion (read_raster)
+find_package(GDAL QUIET)
+if(GDAL_FOUND)
+    message(STATUS "GDAL support enabled (read_raster available)")
+    list(APPEND EXTENSION_SOURCES src/raster/read_raster.cpp)
+else()
+    message(STATUS "GDAL support disabled (libgdal not found)")
+endif()
+
 if(NOT "${DUCKDB_EXTENSION_CONFIGS}" STREQUAL "")
     # Using DuckDB extension build system
     build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -68,6 +78,12 @@ if(NOT "${DUCKDB_EXTENSION_CONFIGS}" STREQUAL "")
         target_link_libraries(${EXTENSION_NAME} WebP::webp)
         target_link_libraries(${LOADABLE_EXTENSION_NAME} WebP::webp)
     endif()
+    if(GDAL_FOUND)
+        target_compile_definitions(${EXTENSION_NAME} PRIVATE RAQUET_HAS_GDAL)
+        target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE RAQUET_HAS_GDAL)
+        target_link_libraries(${EXTENSION_NAME} GDAL::GDAL)
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} GDAL::GDAL)
+    endif()
 else()
     # Standalone build for development
     add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES})
@@ -80,5 +96,9 @@ else()
     if(WebP_FOUND)
         target_compile_definitions(${EXTENSION_NAME} PRIVATE RAQUET_HAS_WEBP)
         target_link_libraries(${EXTENSION_NAME} WebP::webp)
+    endif()
+    if(GDAL_FOUND)
+        target_compile_definitions(${EXTENSION_NAME} PRIVATE RAQUET_HAS_GDAL)
+        target_link_libraries(${EXTENSION_NAME} GDAL::GDAL)
     endif()
 endif()

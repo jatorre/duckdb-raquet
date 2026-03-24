@@ -11,6 +11,10 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 
+#ifdef RAQUET_HAS_GDAL
+#include "read_raster.hpp"
+#endif
+
 namespace duckdb {
 
 // Forward declarations for function registration
@@ -379,6 +383,11 @@ static void LoadInternal(ExtensionLoader &loader) {
     // Register ST_RasterAt table macro for point queries on tables
     auto table_at_macro_info = CreateReadRaquetTableAtMacroInfo();
     loader.RegisterFunction(*table_at_macro_info);
+
+    // Register read_raster table function (requires GDAL)
+#ifdef RAQUET_HAS_GDAL
+    RegisterReadRaster(loader);
+#endif
 }
 
 void RaquetExtension::Load(ExtensionLoader &loader) {

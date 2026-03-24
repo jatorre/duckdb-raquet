@@ -20,6 +20,7 @@ This extension enables DuckDB to query Raquet files directly using SQL, with fun
 - **Band Math** - `ST_NormalizedDifference`, `ST_BandMath` for spectral indices
 - **Spatial Predicates** - `ST_Intersects`, `ST_Contains` for raster-vector operations
 - **Time-Series Support** - CF conventions for temporal rasters (NetCDF compatible)
+- **Raster Ingestion** - `read_raster()` converts GeoTIFF/NetCDF/any GDAL format to Raquet (requires GDAL)
 - **Cloud-Native** - Query remote Parquet files on S3/GCS with predicate pushdown
 - **Native GEOMETRY Support** - Uses DuckDB 1.5+ native GEOMETRY types
 - **Interleaved Band Layout** - Band Interleaved by Pixel (BIP) format
@@ -36,7 +37,7 @@ LOAD raquet;
 
 ### Building from Source
 
-**Prerequisites:** CMake 3.12+, C++17 compiler, zlib, libjpeg (optional), libwebp (optional)
+**Prerequisites:** CMake 3.12+, C++17 compiler, zlib, libjpeg (optional), libwebp (optional), GDAL (optional, for `read_raster`)
 
 ```bash
 git clone https://github.com/CartoDB/duckdb-raquet.git
@@ -68,6 +69,31 @@ SELECT
     (ST_RasterSummaryStats(band_1, metadata)).stddev AS std_value
 FROM read_raquet('dem.parquet')
 LIMIT 5;
+```
+
+### Raster Ingestion (GeoTIFF → Raquet)
+
+```sql
+LOAD raquet;
+
+-- Convert any raster to Raquet format (requires GDAL)
+COPY (SELECT * FROM read_raster('elevation.tif') ORDER BY block)
+TO 'elevation.parquet' (FORMAT parquet);
+
+-- With options: resampling, compression, zoom level
+COPY (
+    SELECT * FROM read_raster('satellite.tif',
+        compression='gzip',
+        resampling='bilinear',
+        block_size=256,
+        max_zoom=12
+    ) ORDER BY block
+) TO 'satellite.parquet' (FORMAT parquet);
+
+-- With per-tile statistics
+COPY (
+    SELECT * FROM read_raster('dem.tif', statistics=true) ORDER BY block
+) TO 'dem.parquet' (FORMAT parquet);
 ```
 
 ### Cloud-Native Queries
@@ -191,6 +217,42 @@ These are the primary functions for working with raster data.
 | `read_raquet_at(file, lon, lat)` | Point query with lon/lat |
 | `read_raquet_at(file, lon, lat, resolution)` | Point query with explicit resolution |
 | `read_raquet_metadata(file)` | Read metadata row only |
+
+### read_raster (Raster Ingestion — requires GDAL)
+
+Converts any GDAL-supported raster format (GeoTIFF, NetCDF, COG, etc.) into a Raquet table.
+Handles CRS reprojection to Web Mercator, tiling, band compression, and overview pyramid generation.
+
+```sql
+SELECT * FROM read_raster(file, [named parameters...])
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `file` | `VARCHAR` | (required) | Path to raster file |
+| `compression` | `VARCHAR` | `'gzip'` | Band compression: `gzip`, `jpeg`, `webp`, `none` |
+| `resampling` | `VARCHAR` | `'nearest'` | Resampling: `nearest`, `bilinear`, `cubic`, `cubicspline`, `lanczos`, `average`, `mode` |
+| `block_size` | `INTEGER` | `256` | Tile size in pixels: `256`, `512`, or `1024` |
+| `max_zoom` | `INTEGER` | auto | Maximum zoom level (auto-detected from resolution) |
+| `min_zoom` | `INTEGER` | auto | Minimum zoom level for overview pyramid |
+| `overviews` | `VARCHAR` | `'auto'` | Overview mode: `auto` (full pyramid) or `none` (native zoom only) |
+| `band_layout` | `VARCHAR` | `'sequential'` | Band layout: `sequential` or `interleaved` |
+| `quality` | `INTEGER` | `85` | Compression quality for JPEG/WebP (1-100) |
+| `statistics` | `BOOLEAN` | `false` | Compute per-tile statistics (count, min, max, sum, mean, stddev) |
+
+**Output columns:** `block` (UBIGINT), `metadata` (VARCHAR), `band_1` ... `band_N` (BLOB).
+When `statistics=true`, adds `band_N_count`, `band_N_min`, `band_N_max`, `band_N_sum`, `band_N_mean`, `band_N_stddev` columns.
+
+**Typical workflow:**
+```sql
+-- Convert and write to Parquet (ORDER BY block for optimal spatial queries)
+COPY (SELECT * FROM read_raster('input.tif') ORDER BY block)
+TO 'output.parquet' (FORMAT parquet);
+
+-- Then query with read_raquet
+SELECT ST_RasterValue(block, band_1, ST_Point(lon, lat), metadata)
+FROM read_raquet('output.parquet');
+```
 
 ### Advanced / Internal Functions
 
@@ -454,9 +516,10 @@ See [docs/PERFORMANCE_COMPARISON.md](docs/PERFORMANCE_COMPARISON.md) for full be
 ## Dependencies
 
 - **DuckDB 1.5+** - Core database engine
-- **zlib** - For gzip decompression
+- **zlib** - For gzip compression/decompression
 - **libjpeg** (optional) - For JPEG lossy compression
 - **libwebp** (optional) - For WebP lossy compression
+- **GDAL** (optional) - For `read_raster()` raster ingestion (CRS reprojection, format support)
 
 ## License
 

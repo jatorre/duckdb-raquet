@@ -5,7 +5,9 @@
     "curl",
     "zlib",
     "libjpeg-turbo",
-    "libwebp"
+    "libwebp",
+    "gdal",
+    "proj"
   ],
   "vcpkg-configuration": {
     "overlay-ports": [

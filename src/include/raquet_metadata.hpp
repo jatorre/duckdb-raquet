@@ -9,18 +9,30 @@
 namespace duckdb {
 namespace raquet {
 
-// Band info structure (v0.3.0 format)
+// Band info structure (v0.3.0+ format)
 struct BandInfo {
     std::string name;
     std::string type;
     double nodata;
     bool has_nodata;
 
-    BandInfo() : nodata(0), has_nodata(false) {}
+    // Extended band metadata (v0.3.0+)
+    std::string description;
+    std::string unit;
+    std::string colorinterp;
+    double scale;
+    double offset;
+    bool has_scale;
+    bool has_offset;
+
+    BandInfo() : nodata(0), has_nodata(false), scale(1.0), offset(0.0),
+                 has_scale(false), has_offset(false) {}
     BandInfo(const std::string &n, const std::string &t)
-        : name(n), type(t), nodata(0), has_nodata(false) {}
+        : name(n), type(t), nodata(0), has_nodata(false), scale(1.0), offset(0.0),
+          has_scale(false), has_offset(false) {}
     BandInfo(const std::string &n, const std::string &t, double nd)
-        : name(n), type(t), nodata(nd), has_nodata(true) {}
+        : name(n), type(t), nodata(nd), has_nodata(true), scale(1.0), offset(0.0),
+          has_scale(false), has_offset(false) {}
 };
 
 // Parsed raquet metadata (v0.4.0 format)
@@ -107,6 +119,104 @@ struct RaquetMetadata {
     // v0.4.0: Get the number of bands
     int num_bands() const {
         return static_cast<int>(bands.size());
+    }
+
+    // Bounds in WGS84 (EPSG:4326) — used for metadata generation
+    double bounds_minlon = 0, bounds_minlat = 0, bounds_maxlon = 0, bounds_maxlat = 0;
+
+    // Serialize to raquet format v0.5.0 JSON metadata
+    std::string to_json() const {
+        std::string json = "{";
+        json += "\"file_format\":\"raquet\"";
+        json += ",\"version\":\"0.5.0\"";
+        json += ",\"crs\":\"" + crs + "\"";
+
+        // Bounds
+        json += ",\"bounds\":[" +
+            std::to_string(bounds_minlon) + "," +
+            std::to_string(bounds_minlat) + "," +
+            std::to_string(bounds_maxlon) + "," +
+            std::to_string(bounds_maxlat) + "]";
+        json += ",\"bounds_crs\":\"EPSG:4326\"";
+
+        // Compression
+        if (compression == "none" || compression.empty()) {
+            json += ",\"compression\":null";
+        } else {
+            json += ",\"compression\":\"" + compression + "\"";
+        }
+        if (compression_quality > 0) {
+            json += ",\"compression_quality\":" + std::to_string(compression_quality);
+        }
+
+        // Band layout
+        if (band_layout == "interleaved") {
+            json += ",\"band_layout\":\"interleaved\"";
+        }
+
+        // Tiling
+        json += ",\"tiling\":{";
+        json += "\"scheme\":\"" + scheme + "\"";
+        json += ",\"block_width\":" + std::to_string(block_width);
+        json += ",\"block_height\":" + std::to_string(block_height);
+        json += ",\"min_zoom\":" + std::to_string(min_zoom);
+        json += ",\"max_zoom\":" + std::to_string(max_zoom);
+        json += ",\"pixel_zoom\":" + std::to_string(pixel_zoom);
+        json += ",\"num_blocks\":" + std::to_string(num_blocks);
+        json += "}";
+
+        // Bands
+        json += ",\"bands\":[";
+        for (size_t i = 0; i < band_info.size(); i++) {
+            if (i > 0) json += ",";
+            const auto &bi = band_info[i];
+            json += "{\"name\":\"" + bi.name + "\"";
+            json += ",\"type\":\"" + bi.type + "\"";
+            if (bi.has_nodata) {
+                if (std::isnan(bi.nodata)) {
+                    json += ",\"nodata\":\"NaN\"";
+                } else if (std::isinf(bi.nodata) && bi.nodata > 0) {
+                    json += ",\"nodata\":\"Infinity\"";
+                } else if (std::isinf(bi.nodata) && bi.nodata < 0) {
+                    json += ",\"nodata\":\"-Infinity\"";
+                } else {
+                    json += ",\"nodata\":" + std::to_string(bi.nodata);
+                }
+            } else {
+                json += ",\"nodata\":null";
+            }
+            if (!bi.description.empty()) {
+                json += ",\"description\":\"" + bi.description + "\"";
+            }
+            if (!bi.unit.empty()) {
+                json += ",\"unit\":\"" + bi.unit + "\"";
+            }
+            if (!bi.colorinterp.empty()) {
+                json += ",\"colorinterp\":\"" + bi.colorinterp + "\"";
+            }
+            if (bi.has_scale) {
+                json += ",\"scale\":" + std::to_string(bi.scale);
+            }
+            if (bi.has_offset) {
+                json += ",\"offset\":" + std::to_string(bi.offset);
+            }
+            json += "}";
+        }
+        json += "]";
+
+        // Tile statistics
+        if (tile_statistics) {
+            json += ",\"tile_statistics\":true";
+            json += ",\"tile_statistics_columns\":[";
+            for (size_t i = 0; i < tile_statistics_columns.size(); i++) {
+                if (i > 0) json += ",";
+                json += "\"" + tile_statistics_columns[i] + "\"";
+            }
+            json += "]";
+        }
+
+        json += "}";
+        return json;
     }
 };
 
