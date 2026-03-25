@@ -129,6 +129,55 @@ struct RaquetMetadata {
     // Bounds in WGS84 (EPSG:4326) — used for metadata generation
     double bounds_minlon = 0, bounds_minlat = 0, bounds_maxlon = 0, bounds_maxlat = 0;
 
+    // Serialize to v0 (legacy) JSON metadata format
+    // Flat tiling fields, bands as arrays, nodata as separate array
+    std::string to_json_v0() const {
+        std::string json = "{";
+        json += "\"file_format\":\"raquet\"";
+
+        // Compression
+        if (compression == "none" || compression.empty()) {
+            json += ",\"compression\":null";
+        } else {
+            json += ",\"compression\":\"" + compression + "\"";
+        }
+
+        // Flat tiling fields (v0 names)
+        json += ",\"block_width\":" + std::to_string(block_width);
+        json += ",\"block_height\":" + std::to_string(block_height);
+        json += ",\"minresolution\":" + std::to_string(min_zoom);
+        json += ",\"maxresolution\":" + std::to_string(max_zoom);
+        json += ",\"pixel_resolution\":" + std::to_string(pixel_zoom);
+        json += ",\"num_blocks\":" + std::to_string(num_blocks);
+
+        // Bands as array of arrays: [["name", "type"], ...]
+        json += ",\"bands\":[";
+        for (size_t i = 0; i < band_info.size(); i++) {
+            if (i > 0) json += ",";
+            json += "[\"" + band_info[i].name + "\",\"" + band_info[i].type + "\"]";
+        }
+        json += "]";
+
+        // Nodata as separate top-level array
+        json += ",\"nodata\":[";
+        for (size_t i = 0; i < band_info.size(); i++) {
+            if (i > 0) json += ",";
+            if (band_info[i].has_nodata) {
+                if (std::isnan(band_info[i].nodata)) {
+                    json += "null"; // v0 doesn't support NaN string convention
+                } else {
+                    json += std::to_string(band_info[i].nodata);
+                }
+            } else {
+                json += "null";
+            }
+        }
+        json += "]";
+
+        json += "}";
+        return json;
+    }
+
     // Serialize to raquet format v0.5.0 JSON metadata
     std::string to_json() const {
         std::string json = "{";

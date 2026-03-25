@@ -130,6 +130,7 @@ struct ReadRasterBindData : public TableFunctionData {
     std::string band_layout = "sequential";
     std::string overviews = "auto";
     std::string zoom_strategy = "auto"; // auto, lower, upper
+    std::string output_format = "v0.5.0"; // v0 or v0.5.0
 
     // CF time dimension (NetCDF)
     bool has_cf_time = false;
@@ -594,6 +595,11 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
             if (bind_data->zoom_strategy != "auto" && bind_data->zoom_strategy != "lower" &&
                 bind_data->zoom_strategy != "upper") {
                 throw InvalidInputException("zoom_strategy must be 'auto', 'lower', or 'upper'");
+            }
+        } else if (kv.first == "format") {
+            bind_data->output_format = StringUtil::Lower(kv.second.GetValue<string>());
+            if (bind_data->output_format != "v0" && bind_data->output_format != "v0.5.0") {
+                throw InvalidInputException("format must be 'v0' or 'v0.5.0'");
             }
         }
     }
@@ -1156,7 +1162,8 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             meta.bands.push_back({bi.name, bi.type});
         }
 
-        std::string metadata_json = meta.to_json();
+        std::string metadata_json = (bind_data.output_format == "v0")
+            ? meta.to_json_v0() : meta.to_json();
 
         // Emit metadata row: block=0, metadata=json, bands=NULL
         idx_t col = 0;
@@ -1215,6 +1222,7 @@ void RegisterReadRaster(ExtensionLoader &loader) {
     func.named_parameters["quality"] = LogicalType::INTEGER;
     func.named_parameters["statistics"] = LogicalType::BOOLEAN;
     func.named_parameters["zoom_strategy"] = LogicalType::VARCHAR;
+    func.named_parameters["format"] = LogicalType::VARCHAR;
     func.cardinality = ReadRasterCardinality;
 
     loader.RegisterFunction(func);
