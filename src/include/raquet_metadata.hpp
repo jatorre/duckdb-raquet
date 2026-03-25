@@ -379,7 +379,54 @@ inline std::string extract_json_object(const std::string &json, const std::strin
     return json.substr(start, pos - start);
 }
 
-// Parse bands array from metadata JSON (returns both legacy format and full BandInfo)
+// Extract a JSON array of numbers: "key": [1.0, null, 0]
+// Returns values with a parallel has_value vector for null detection
+inline void extract_json_number_array(const std::string &json, const std::string &key,
+                                       std::vector<double> &values, std::vector<bool> &has_value) {
+    values.clear();
+    has_value.clear();
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return;
+    pos += search.length();
+
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n')) pos++;
+    if (pos >= json.size() || json[pos] != '[') return;
+
+    size_t arr_end = json.find(']', pos);
+    if (arr_end == std::string::npos) return;
+
+    std::string arr = json.substr(pos + 1, arr_end - pos - 1);
+    size_t p = 0;
+    while (p < arr.size()) {
+        while (p < arr.size() && (arr[p] == ' ' || arr[p] == ',')) p++;
+        if (p >= arr.size()) break;
+
+        if (arr.compare(p, 4, "null") == 0) {
+            values.push_back(0);
+            has_value.push_back(false);
+            p += 4;
+        } else {
+            size_t end = p;
+            while (end < arr.size() && arr[end] != ',' && arr[end] != ']') end++;
+            std::string val_str = arr.substr(p, end - p);
+            // Trim whitespace
+            while (!val_str.empty() && (val_str.back() == ' ' || val_str.back() == '\t')) val_str.pop_back();
+            try {
+                values.push_back(parse_nodata_value(val_str));
+                has_value.push_back(true);
+            } catch (...) {
+                values.push_back(0);
+                has_value.push_back(false);
+            }
+            p = end;
+        }
+    }
+}
+
+// Parse bands array from metadata JSON (handles both v0 and v0.5.0 formats)
+// v0: bands is array of arrays [["name", "type"], ...] with separate "nodata" array
+// v0.5.0: bands is array of objects [{"name": ..., "type": ..., "nodata": ...}, ...]
 inline void parse_bands_full(const std::string &json,
                              std::vector<std::pair<std::string, std::string>> &bands,
                              std::vector<BandInfo> &band_info) {
@@ -393,39 +440,111 @@ inline void parse_bands_full(const std::string &json,
     size_t arr_start = json.find('[', bands_pos);
     if (arr_start == std::string::npos) return;
 
-    size_t arr_end = json.find(']', arr_start);
-    if (arr_end == std::string::npos) return;
+    // Detect format: v0 has nested arrays [[...], ...], v0.5.0 has objects [{...}, ...]
+    // Skip whitespace after '['
+    size_t first_elem = arr_start + 1;
+    while (first_elem < json.size() && (json[first_elem] == ' ' || json[first_elem] == '\t' ||
+           json[first_elem] == '\n' || json[first_elem] == '\r')) first_elem++;
 
-    std::string bands_str = json.substr(arr_start + 1, arr_end - arr_start - 1);
+    if (first_elem < json.size() && json[first_elem] == '[') {
+        // v0 format: bands is array of arrays [["name", "type"], ...]
+        // Find the end of the outer array (need to handle nested brackets)
+        int depth = 1;
+        size_t pos = arr_start + 1;
+        while (pos < json.size() && depth > 0) {
+            if (json[pos] == '[') depth++;
+            else if (json[pos] == ']') depth--;
+            pos++;
+        }
+        size_t arr_end = pos - 1;
+        std::string bands_str = json.substr(arr_start + 1, arr_end - arr_start - 1);
 
-    // Parse each band object
-    size_t pos = 0;
-    while (pos < bands_str.size()) {
-        size_t obj_start = bands_str.find('{', pos);
-        if (obj_start == std::string::npos) break;
+        // Parse each inner array ["name", "type"]
+        size_t p = 0;
+        while (p < bands_str.size()) {
+            size_t inner_start = bands_str.find('[', p);
+            if (inner_start == std::string::npos) break;
+            size_t inner_end = bands_str.find(']', inner_start);
+            if (inner_end == std::string::npos) break;
 
-        size_t obj_end = bands_str.find('}', obj_start);
-        if (obj_end == std::string::npos) break;
+            std::string inner = bands_str.substr(inner_start + 1, inner_end - inner_start - 1);
 
-        std::string band_obj = bands_str.substr(obj_start, obj_end - obj_start + 1);
-
-        std::string name = extract_json_string(band_obj, "name");
-        std::string type = extract_json_string(band_obj, "type");
-
-        if (!name.empty() && !type.empty()) {
-            bands.push_back({name, type});
-
-            BandInfo info(name, type);
-            if (extract_json_has_value(band_obj, "nodata")) {
-                // Use parse_nodata_value to handle Zarr v3 string conventions
-                std::string nodata_str = extract_json_string(band_obj, "nodata");
-                info.nodata = parse_nodata_value(nodata_str);
-                info.has_nodata = true;
+            // Extract two quoted strings from the inner array
+            std::vector<std::string> parts;
+            size_t q = 0;
+            while (q < inner.size() && parts.size() < 2) {
+                size_t q_start = inner.find('"', q);
+                if (q_start == std::string::npos) break;
+                size_t q_end = inner.find('"', q_start + 1);
+                if (q_end == std::string::npos) break;
+                parts.push_back(inner.substr(q_start + 1, q_end - q_start - 1));
+                q = q_end + 1;
             }
-            band_info.push_back(info);
+
+            if (parts.size() == 2) {
+                bands.push_back({parts[0], parts[1]});
+                band_info.push_back(BandInfo(parts[0], parts[1]));
+            }
+
+            p = inner_end + 1;
         }
 
-        pos = obj_end + 1;
+        // v0: nodata is a separate top-level array
+        std::vector<double> nodata_values;
+        std::vector<bool> nodata_has;
+        extract_json_number_array(json, "nodata", nodata_values, nodata_has);
+        for (size_t i = 0; i < band_info.size() && i < nodata_values.size(); i++) {
+            if (nodata_has[i]) {
+                band_info[i].nodata = nodata_values[i];
+                band_info[i].has_nodata = true;
+            }
+        }
+    } else if (first_elem < json.size() && json[first_elem] == '{') {
+        // v0.5.0 format: bands is array of objects [{"name": ..., "type": ...}, ...]
+        size_t arr_end = arr_start + 1;
+        int depth = 1;
+        while (arr_end < json.size() && depth > 0) {
+            if (json[arr_end] == '[') depth++;
+            else if (json[arr_end] == ']') depth--;
+            arr_end++;
+        }
+        arr_end--;
+        std::string bands_str = json.substr(arr_start + 1, arr_end - arr_start - 1);
+
+        size_t pos = 0;
+        while (pos < bands_str.size()) {
+            size_t obj_start = bands_str.find('{', pos);
+            if (obj_start == std::string::npos) break;
+
+            // Find matching closing brace (handle nested objects)
+            int obj_depth = 1;
+            size_t obj_end = obj_start + 1;
+            while (obj_end < bands_str.size() && obj_depth > 0) {
+                if (bands_str[obj_end] == '{') obj_depth++;
+                else if (bands_str[obj_end] == '}') obj_depth--;
+                obj_end++;
+            }
+            obj_end--;
+
+            std::string band_obj = bands_str.substr(obj_start, obj_end - obj_start + 1);
+
+            std::string name = extract_json_string(band_obj, "name");
+            std::string type = extract_json_string(band_obj, "type");
+
+            if (!name.empty() && !type.empty()) {
+                bands.push_back({name, type});
+
+                BandInfo info(name, type);
+                if (extract_json_has_value(band_obj, "nodata")) {
+                    std::string nodata_str = extract_json_string(band_obj, "nodata");
+                    info.nodata = parse_nodata_value(nodata_str);
+                    info.has_nodata = true;
+                }
+                band_info.push_back(info);
+            }
+
+            pos = obj_end + 1;
+        }
     }
 }
 
@@ -456,9 +575,13 @@ inline RaquetMetadata parse_metadata(const std::string &json) {
 
     meta.crs = extract_json_string(json, "crs");
 
-    // Parse tiling object (v0.3.0)
+    // Detect version: v0 has no "version" field, v0.5.0+ has it
+    std::string version = extract_json_string(json, "version");
+
+    // Parse tiling info — differs between v0 (flat) and v0.5.0+ (nested tiling object)
     std::string tiling = extract_json_object(json, "tiling");
     if (!tiling.empty()) {
+        // v0.3.0+ format: nested tiling object
         meta.min_zoom = extract_json_int(tiling, "min_zoom", 0);
         meta.max_zoom = extract_json_int(tiling, "max_zoom", 26);
         meta.pixel_zoom = extract_json_int(tiling, "pixel_zoom", 0);
@@ -467,13 +590,13 @@ inline RaquetMetadata parse_metadata(const std::string &json) {
         meta.block_height = extract_json_int(tiling, "block_height", 256);
         meta.scheme = extract_json_string(tiling, "scheme");
     } else {
-        // Defaults if no tiling object
-        meta.min_zoom = 0;
-        meta.max_zoom = 26;
-        meta.pixel_zoom = 0;
-        meta.num_blocks = 0;
-        meta.block_width = 256;
-        meta.block_height = 256;
+        // v0 format: flat fields with old names (minresolution/maxresolution)
+        meta.block_width = extract_json_int(json, "block_width", 256);
+        meta.block_height = extract_json_int(json, "block_height", 256);
+        meta.min_zoom = extract_json_int(json, "minresolution", 0);
+        meta.max_zoom = extract_json_int(json, "maxresolution", 26);
+        meta.pixel_zoom = extract_json_int(json, "pixel_resolution", 0);
+        meta.num_blocks = extract_json_int(json, "num_blocks", 0);
         meta.scheme = "quadbin";
     }
 

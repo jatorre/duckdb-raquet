@@ -5,6 +5,7 @@
 #include "band_decoder.hpp"
 #include "raquet_metadata.hpp"
 #include "quadbin.hpp"
+#include "proj_embed.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -597,7 +598,8 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         }
     }
 
-    // Initialize GDAL (safe to call multiple times)
+    // Initialize embedded PROJ database and GDAL
+    raquet::InitEmbeddedProj();
     GDALAllRegister();
 
     // Open the raster

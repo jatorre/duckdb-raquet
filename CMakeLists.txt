@@ -58,6 +58,57 @@ endif()
 if(GDAL_FOUND)
     message(STATUS "GDAL support enabled (read_raster available)")
     list(APPEND EXTENSION_SOURCES src/raster/read_raster.cpp)
+
+    # Find PROJ and SQLite3 for embedded proj.db support
+    find_package(PROJ QUIET CONFIG)
+    find_package(unofficial-sqlite3 QUIET CONFIG)
+    if(NOT unofficial-sqlite3_FOUND)
+        find_package(SQLite3 QUIET)
+    endif()
+
+    # Generate proj_db.c from proj.db at build time
+    # Find proj.db from PROJ's share directory
+    set(PROJ_DB_FOUND FALSE)
+    if(PROJ_FOUND OR PROJ4_FOUND)
+        # Try vcpkg installed location
+        foreach(PREFIX ${CMAKE_PREFIX_PATH} ${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET})
+            if(EXISTS "${PREFIX}/share/proj/proj.db")
+                set(PROJ_DB_PATH "${PREFIX}/share/proj/proj.db")
+                set(PROJ_DB_FOUND TRUE)
+                break()
+            endif()
+        endforeach()
+    endif()
+    # Fallback: system paths
+    if(NOT PROJ_DB_FOUND)
+        find_file(PROJ_DB_PATH proj.db
+            PATHS /opt/homebrew/share/proj /usr/share/proj /usr/local/share/proj
+            NO_DEFAULT_PATH)
+        if(PROJ_DB_PATH)
+            set(PROJ_DB_FOUND TRUE)
+        endif()
+    endif()
+
+    if(PROJ_DB_FOUND)
+        message(STATUS "Found proj.db: ${PROJ_DB_PATH}")
+        set(PROJ_DB_C "${CMAKE_CURRENT_BINARY_DIR}/proj_db.c")
+        add_custom_command(
+            OUTPUT "${PROJ_DB_C}"
+            COMMAND ${CMAKE_COMMAND} -E echo "Generating proj_db.c from ${PROJ_DB_PATH}..."
+            COMMAND xxd -i proj.db "${PROJ_DB_C}"
+            WORKING_DIRECTORY "${PROJ_DB_PATH}/.."
+            DEPENDS "${PROJ_DB_PATH}"
+            COMMENT "Embedding proj.db into C source"
+        )
+        list(APPEND EXTENSION_SOURCES
+            "${PROJ_DB_C}"
+            src/raster/memvfs.c
+            src/raster/proj_embed.cpp
+        )
+        message(STATUS "PROJ database embedding enabled")
+    else()
+        message(STATUS "proj.db not found - PROJ_DATA env var required at runtime")
+    endif()
 else()
     message(STATUS "GDAL support disabled (libgdal not found)")
 endif()
@@ -86,6 +137,19 @@ if(NOT "${DUCKDB_EXTENSION_CONFIGS}" STREQUAL "")
         target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE RAQUET_HAS_GDAL)
         target_link_libraries(${EXTENSION_NAME} GDAL::GDAL)
         target_link_libraries(${LOADABLE_EXTENSION_NAME} GDAL::GDAL)
+        if(PROJ_DB_FOUND)
+            if(TARGET PROJ::proj)
+                target_link_libraries(${EXTENSION_NAME} PROJ::proj)
+                target_link_libraries(${LOADABLE_EXTENSION_NAME} PROJ::proj)
+            endif()
+            if(TARGET unofficial::sqlite3::sqlite3)
+                target_link_libraries(${EXTENSION_NAME} unofficial::sqlite3::sqlite3)
+                target_link_libraries(${LOADABLE_EXTENSION_NAME} unofficial::sqlite3::sqlite3)
+            elseif(TARGET SQLite::SQLite3)
+                target_link_libraries(${EXTENSION_NAME} SQLite::SQLite3)
+                target_link_libraries(${LOADABLE_EXTENSION_NAME} SQLite::SQLite3)
+            endif()
+        endif()
     endif()
 else()
     # Standalone build for development
@@ -103,5 +167,15 @@ else()
     if(GDAL_FOUND)
         target_compile_definitions(${EXTENSION_NAME} PRIVATE RAQUET_HAS_GDAL)
         target_link_libraries(${EXTENSION_NAME} GDAL::GDAL)
+        if(PROJ_DB_FOUND)
+            if(TARGET PROJ::proj)
+                target_link_libraries(${EXTENSION_NAME} PROJ::proj)
+            endif()
+            if(TARGET unofficial::sqlite3::sqlite3)
+                target_link_libraries(${EXTENSION_NAME} unofficial::sqlite3::sqlite3)
+            elseif(TARGET SQLite::SQLite3)
+                target_link_libraries(${EXTENSION_NAME} SQLite::SQLite3)
+            endif()
+        endif()
     endif()
 endif()
