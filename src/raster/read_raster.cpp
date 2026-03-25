@@ -149,12 +149,10 @@ struct ReadRasterBindData : public TableFunctionData {
 };
 
 // ─────────────────────────────────────────────
-// Frame for overview pyramid traversal (matches CLI's Frame)
+// Overview tile (flat list, processed single-threaded)
 // ─────────────────────────────────────────────
 struct OverviewFrame {
     RasterTile tile;
-    std::vector<RasterTile> inputs;   // child tiles to process
-    std::vector<GDALDatasetH> outputs; // warped child datasets (kept in /vsimem/)
 };
 
 // ─────────────────────────────────────────────
@@ -184,8 +182,8 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
 
     // Tracking
     std::atomic<int> total_blocks{0};
-    bool metadata_emitted = false;
-    bool finished = false;
+    std::atomic<bool> metadata_emitted{false};
+    std::atomic<bool> finished{false};
 
     // Whether we need overviews at all
     bool has_overviews = false;
@@ -195,11 +193,6 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
     }
 
     ~ReadRasterGlobalState() {
-        for (auto &frame : overview_frames) {
-            for (auto ds : frame.outputs) {
-                if (ds) GDALClose(ds);
-            }
-        }
         if (overview_wkt) CPLFree(overview_wkt);
         if (overview_srs) OSRDestroySpatialReference(overview_srs);
         if (overview_src_ds) GDALClose(overview_src_ds);
@@ -241,14 +234,19 @@ static std::vector<RasterTile> EnumerateTiles(double minlon, double minlat,
 
 // ─────────────────────────────────────────────
 // Helper: Create an in-memory tile dataset for warping into
-// ─────────────────────────────────────────────
+// Thread-safe counter for unique /vsimem/ paths
+static std::atomic<uint64_t> vsimem_counter{0};
+
 static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *wkt_3857,
                                        const RasterTile &tile, int tile_size,
                                        int band_count, GDALDataType dtype,
-                                       double nodata, bool has_nodata) {
-    // Unique virtual path for this tile
+                                       double nodata, bool has_nodata,
+                                       std::string &path_out) {
+    // Unique virtual path (atomic counter avoids collisions across threads)
+    uint64_t id = vsimem_counter++;
     char path[256];
-    snprintf(path, sizeof(path), "/vsimem/raquet-tile-%d-%d-%d.tif", tile.z, tile.x, tile.y);
+    snprintf(path, sizeof(path), "/vsimem/raquet-%llu.tif", static_cast<unsigned long long>(id));
+    path_out = path;
 
     GDALDatasetH ds = GDALCreate(driver, path, tile_size, tile_size, band_count, dtype, nullptr);
     if (!ds) {
@@ -361,7 +359,7 @@ static bool IsTileEmpty(GDALDatasetH ds, double nodata, bool has_nodata) {
 
     // Read first band and check if all pixels are nodata
     size_t num_pixels = static_cast<size_t>(width) * height;
-    GDALDataType dt = GDALGetRasterBandXSize(band) > 0 ? GDALGetRasterDataType(band) : GDT_Byte;
+    GDALDataType dt = GDALGetRasterDataType(band);
     int dt_size = GDALGetDataTypeSizeBytes(dt);
 
     std::vector<uint8_t> buf(num_pixels * dt_size);
@@ -991,11 +989,12 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         auto &tile = state.native_tiles[my_idx];
 
         // Create tile dataset and warp
+        std::string tile_path;
         GDALDatasetH tile_ds = CreateTileDataset(
             local.gtiff_driver, local.web_mercator_wkt,
             tile, bind_data.block_size,
             bind_data.raster_band_count, bind_data.gdal_dtype,
-            state.nodata_value, state.has_nodata);
+            state.nodata_value, state.has_nodata, tile_path);
 
         WarpIntoTile(local.src_ds, tile_ds, state.source_resampling,
                      state.nodata_value, state.has_nodata);
@@ -1015,6 +1014,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         }
 
         GDALClose(tile_ds);
+        VSIUnlink(tile_path.c_str());
     }
 
     // If we emitted rows from native tiles, return them
@@ -1033,11 +1033,12 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                   });
 
         for (auto &frame : state.overview_frames) {
+            std::string ovr_path;
             GDALDatasetH tile_ds = CreateTileDataset(
                 state.overview_driver, state.overview_wkt,
                 frame.tile, bind_data.block_size,
                 bind_data.raster_band_count, bind_data.gdal_dtype,
-                state.nodata_value, state.has_nodata);
+                state.nodata_value, state.has_nodata, ovr_path);
 
             // Try COG overview first
             bool used_cog = false;
@@ -1082,12 +1083,14 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             }
 
             GDALClose(tile_ds);
+            VSIUnlink(ovr_path.c_str());
         }
         state.overviews_built = true;
     }
 
-    // ── Phase 3: Emit metadata row ──
-    if (!state.metadata_emitted) {
+    // ── Phase 3: Emit metadata row (exactly once, thread-safe) ──
+    bool expected = false;
+    if (state.metadata_emitted.compare_exchange_strong(expected, true)) {
         // Build metadata
         raquet::RaquetMetadata meta;
         meta.file_format = "raquet";
@@ -1178,11 +1181,6 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         }
 
         row_count++;
-        state.metadata_emitted = true;
-        state.finished = true;
-    }
-
-    if (state.metadata_emitted) {
         state.finished = true;
     }
 
