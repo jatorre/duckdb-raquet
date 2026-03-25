@@ -1,4 +1,5 @@
 #include "band_encoder.hpp"
+#include <cstring>
 #include <stdexcept>
 #include <zlib.h>
 
