@@ -471,6 +471,26 @@ static TileData ReadAndCompressBands(
 }
 
 // ─────────────────────────────────────────────
+// Pure-math WGS84 ↔ Web Mercator conversions (no PROJ needed)
+// ─────────────────────────────────────────────
+static double LonToMercatorX(double lon) {
+    return lon * quadbin::EARTH_RADIUS * quadbin::PI / 180.0;
+}
+
+static double LatToMercatorY(double lat) {
+    double lat_rad = lat * quadbin::PI / 180.0;
+    return quadbin::EARTH_RADIUS * std::log(std::tan(quadbin::PI / 4.0 + lat_rad / 2.0));
+}
+
+static double MercatorXToLon(double x) {
+    return x * 180.0 / (quadbin::EARTH_RADIUS * quadbin::PI);
+}
+
+static double MercatorYToLat(double y) {
+    return (2.0 * std::atan(std::exp(y / quadbin::EARTH_RADIUS)) - quadbin::PI / 2.0) * 180.0 / quadbin::PI;
+}
+
+// ─────────────────────────────────────────────
 // Helper: Calculate resolution in meters/pixel via coordinate transformation
 // Follows CLI's find_resolution() logic
 // ─────────────────────────────────────────────
@@ -486,6 +506,38 @@ static double CalculateResolution(GDALDatasetH ds, OGRCoordinateTransformationH 
 
     OCTTransform(tx, 1, &x1, &y1, nullptr);
     OCTTransform(tx, 1, &x2, &y2, nullptr);
+
+    return std::hypot(x2 - x1, y2 - y1) / std::hypot(static_cast<double>(xdim),
+                                                        static_cast<double>(ydim));
+}
+
+// Resolution in Web Mercator meters/pixel using pure math (WGS84 source)
+static double CalculateResolutionFromWGS84(GDALDatasetH ds) {
+    double gt[6];
+    GDALGetGeoTransform(ds, gt);
+    double xoff = gt[0], xres = gt[1], yoff = gt[3], yres = gt[5];
+    int xdim = GDALGetRasterXSize(ds);
+    int ydim = GDALGetRasterYSize(ds);
+
+    double x1 = LonToMercatorX(xoff);
+    double y1 = LatToMercatorY(yoff);
+    double x2 = LonToMercatorX(xoff + xdim * xres);
+    double y2 = LatToMercatorY(yoff + ydim * yres);
+
+    return std::hypot(x2 - x1, y2 - y1) / std::hypot(static_cast<double>(xdim),
+                                                        static_cast<double>(ydim));
+}
+
+// Resolution in Web Mercator meters/pixel (source already in 3857)
+static double CalculateResolutionFromMercator(GDALDatasetH ds) {
+    double gt[6];
+    GDALGetGeoTransform(ds, gt);
+    double xoff = gt[0], xres = gt[1], yoff = gt[3], yres = gt[5];
+    int xdim = GDALGetRasterXSize(ds);
+    int ydim = GDALGetRasterYSize(ds);
+
+    double x1 = xoff, y1 = yoff;
+    double x2 = xoff + xdim * xres, y2 = yoff + ydim * yres;
 
     return std::hypot(x2 - x1, y2 - y1) / std::hypot(static_cast<double>(xdim),
                                                         static_cast<double>(ydim));
@@ -523,6 +575,46 @@ static void CalculateBounds(GDALDatasetH ds, OGRCoordinateTransformationH tx4326
 
     for (int i = 0; i < 4; i++) {
         OCTTransform(tx4326, 1, &xs[i], &ys[i], nullptr);
+    }
+
+    minlon = *std::min_element(xs, xs + 4);
+    maxlon = *std::max_element(xs, xs + 4);
+    minlat = *std::min_element(ys, ys + 4);
+    maxlat = *std::max_element(ys, ys + 4);
+}
+
+// Bounds directly from geotransform (source already in WGS84)
+static void CalculateBoundsFromWGS84(GDALDatasetH ds,
+                                      double &minlon, double &minlat, double &maxlon, double &maxlat) {
+    double gt[6];
+    GDALGetGeoTransform(ds, gt);
+    int xdim = GDALGetRasterXSize(ds);
+    int ydim = GDALGetRasterYSize(ds);
+
+    double xs[4] = {gt[0], gt[0], gt[0] + xdim * gt[1], gt[0] + xdim * gt[1]};
+    double ys[4] = {gt[3], gt[3] + ydim * gt[5], gt[3], gt[3] + ydim * gt[5]};
+
+    minlon = *std::min_element(xs, xs + 4);
+    maxlon = *std::max_element(xs, xs + 4);
+    minlat = *std::min_element(ys, ys + 4);
+    maxlat = *std::max_element(ys, ys + 4);
+}
+
+// Bounds from Web Mercator source via pure math
+static void CalculateBoundsFromMercator(GDALDatasetH ds,
+                                         double &minlon, double &minlat, double &maxlon, double &maxlat) {
+    double gt[6];
+    GDALGetGeoTransform(ds, gt);
+    int xdim = GDALGetRasterXSize(ds);
+    int ydim = GDALGetRasterYSize(ds);
+
+    double xs[4] = {gt[0], gt[0], gt[0] + xdim * gt[1], gt[0] + xdim * gt[1]};
+    double ys[4] = {gt[3], gt[3] + ydim * gt[5], gt[3], gt[3] + ydim * gt[5]};
+
+    // Convert 3857 corners to 4326
+    for (int i = 0; i < 4; i++) {
+        xs[i] = MercatorXToLon(xs[i]);
+        ys[i] = MercatorYToLat(ys[i]);
     }
 
     minlon = *std::min_element(xs, xs + 4);
@@ -716,73 +808,121 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
     // CRS detection
     OGRSpatialReferenceH src_srs = nullptr;
     const char *proj_wkt = GDALGetProjectionRef(ds);
+    bool src_is_wgs84 = false;
     if (proj_wkt && strlen(proj_wkt) > 0) {
         src_srs = OSRNewSpatialReference(proj_wkt);
         bind_data->src_wkt = proj_wkt;
     } else {
-        // Assume WGS84
+        // No CRS — assume WGS84
         src_srs = OSRNewSpatialReference(nullptr);
         OSRImportFromEPSG(src_srs, 4326);
         char *wkt = nullptr;
         OSRExportToWkt(src_srs, &wkt);
         bind_data->src_wkt = wkt;
         CPLFree(wkt);
+        src_is_wgs84 = true;
     }
     OSRSetAxisMappingStrategy(src_srs, OAMS_TRADITIONAL_GIS_ORDER);
 
-    // Check if source is already Web Mercator
-    OGRSpatialReferenceH merc_srs = OSRNewSpatialReference(nullptr);
-    OSRImportFromEPSG(merc_srs, 3857);
-    bind_data->src_is_web_mercator = OSRIsSame(src_srs, merc_srs);
+    // Detect well-known CRS to enable PROJ-free fast path
     bind_data->overview_count = GDALGetOverviewCount(first_band);
+    if (!src_is_wgs84) {
+        // Check via EPSG authority code
+        const char *auth_name = OSRGetAuthorityName(src_srs, nullptr);
+        const char *auth_code = OSRGetAuthorityCode(src_srs, nullptr);
+        if (auth_name && auth_code && std::string(auth_name) == "EPSG") {
+            int epsg = std::atoi(auth_code);
+            if (epsg == 4326) {
+                src_is_wgs84 = true;
+            } else if (epsg == 3857 || epsg == 900913) {
+                bind_data->src_is_web_mercator = true;
+            }
+        }
+        // Fallback: check if geographic (likely 4326-compatible)
+        if (!src_is_wgs84 && !bind_data->src_is_web_mercator && OSRIsGeographic(src_srs)) {
+            OGRSpatialReferenceH wgs84_check = OSRNewSpatialReference(nullptr);
+            OSRImportFromEPSG(wgs84_check, 4326);
+            if (OSRIsSame(src_srs, wgs84_check)) {
+                src_is_wgs84 = true;
+            }
+            OSRDestroySpatialReference(wgs84_check);
+        }
+    }
 
-    // Create coordinate transformations
-    OGRSpatialReferenceH wgs84_srs = OSRNewSpatialReference(nullptr);
-    OSRImportFromEPSG(wgs84_srs, 4326);
-    OSRSetAxisMappingStrategy(wgs84_srs, OAMS_TRADITIONAL_GIS_ORDER);
+    // Fast path: WGS84 and Web Mercator use pure math (no PROJ database needed)
+    if (src_is_wgs84 || bind_data->src_is_web_mercator) {
+        double resolution;
+        if (src_is_wgs84) {
+            resolution = CalculateResolutionFromWGS84(ds);
+            CalculateBoundsFromWGS84(ds, bind_data->bounds_minlon, bind_data->bounds_minlat,
+                                     bind_data->bounds_maxlon, bind_data->bounds_maxlat);
+        } else {
+            resolution = CalculateResolutionFromMercator(ds);
+            CalculateBoundsFromMercator(ds, bind_data->bounds_minlon, bind_data->bounds_minlat,
+                                        bind_data->bounds_maxlon, bind_data->bounds_maxlat);
+        }
+        if (bind_data->max_zoom == 0) {
+            bind_data->max_zoom = CalculateZoom(resolution, bind_data->block_zoom, bind_data->zoom_strategy);
+            bind_data->max_zoom = std::max(0, std::min(26, bind_data->max_zoom));
+        }
+        if (bind_data->overviews == "none") {
+            bind_data->min_zoom = bind_data->max_zoom;
+        } else if (bind_data->min_zoom == 0) {
+            bind_data->min_zoom = CalculateMinZoom(
+                bind_data->bounds_minlon, bind_data->bounds_minlat,
+                bind_data->bounds_maxlon, bind_data->bounds_maxlat,
+                bind_data->max_zoom, bind_data->block_zoom);
+        }
+        OSRDestroySpatialReference(src_srs);
+        GDALClose(ds);
+    } else {
+        // General path: use PROJ-based coordinate transformations
+        OGRSpatialReferenceH merc_srs = OSRNewSpatialReference(nullptr);
+        OSRImportFromEPSG(merc_srs, 3857);
+        bind_data->src_is_web_mercator = OSRIsSame(src_srs, merc_srs);
 
-    OGRCoordinateTransformationH tx3857 = OCTNewCoordinateTransformation(src_srs, merc_srs);
-    OGRCoordinateTransformationH tx4326 = OCTNewCoordinateTransformation(src_srs, wgs84_srs);
+        OGRSpatialReferenceH wgs84_srs = OSRNewSpatialReference(nullptr);
+        OSRImportFromEPSG(wgs84_srs, 4326);
+        OSRSetAxisMappingStrategy(wgs84_srs, OAMS_TRADITIONAL_GIS_ORDER);
 
-    if (!tx3857 || !tx4326) {
-        if (tx3857) OCTDestroyCoordinateTransformation(tx3857);
-        if (tx4326) OCTDestroyCoordinateTransformation(tx4326);
+        OGRCoordinateTransformationH tx3857 = OCTNewCoordinateTransformation(src_srs, merc_srs);
+        OGRCoordinateTransformationH tx4326 = OCTNewCoordinateTransformation(src_srs, wgs84_srs);
+
+        if (!tx3857 || !tx4326) {
+            if (tx3857) OCTDestroyCoordinateTransformation(tx3857);
+            if (tx4326) OCTDestroyCoordinateTransformation(tx4326);
+            OSRDestroySpatialReference(src_srs);
+            OSRDestroySpatialReference(merc_srs);
+            OSRDestroySpatialReference(wgs84_srs);
+            GDALClose(ds);
+            throw IOException("Failed to create coordinate transformations for CRS. "
+                              "If PROJ database is not available, use WGS84 (EPSG:4326) or "
+                              "Web Mercator (EPSG:3857) source data which do not require PROJ.");
+        }
+
+        double resolution = CalculateResolution(ds, tx3857);
+        if (bind_data->max_zoom == 0) {
+            bind_data->max_zoom = CalculateZoom(resolution, bind_data->block_zoom, bind_data->zoom_strategy);
+            bind_data->max_zoom = std::max(0, std::min(26, bind_data->max_zoom));
+        }
+        CalculateBounds(ds, tx4326, bind_data->bounds_minlon, bind_data->bounds_minlat,
+                        bind_data->bounds_maxlon, bind_data->bounds_maxlat);
+        if (bind_data->overviews == "none") {
+            bind_data->min_zoom = bind_data->max_zoom;
+        } else if (bind_data->min_zoom == 0) {
+            bind_data->min_zoom = CalculateMinZoom(
+                bind_data->bounds_minlon, bind_data->bounds_minlat,
+                bind_data->bounds_maxlon, bind_data->bounds_maxlat,
+                bind_data->max_zoom, bind_data->block_zoom);
+        }
+
+        OCTDestroyCoordinateTransformation(tx3857);
+        OCTDestroyCoordinateTransformation(tx4326);
         OSRDestroySpatialReference(src_srs);
         OSRDestroySpatialReference(merc_srs);
         OSRDestroySpatialReference(wgs84_srs);
         GDALClose(ds);
-        throw IOException("Failed to create coordinate transformations for CRS");
     }
-
-    // Calculate resolution and zoom
-    double resolution = CalculateResolution(ds, tx3857);
-    if (bind_data->max_zoom == 0) {
-        bind_data->max_zoom = CalculateZoom(resolution, bind_data->block_zoom, bind_data->zoom_strategy);
-        // Clamp to valid range
-        bind_data->max_zoom = std::max(0, std::min(26, bind_data->max_zoom));
-    }
-
-    // Calculate WGS84 bounds
-    CalculateBounds(ds, tx4326, bind_data->bounds_minlon, bind_data->bounds_minlat,
-                    bind_data->bounds_maxlon, bind_data->bounds_maxlat);
-
-    // Calculate min zoom
-    if (bind_data->overviews == "none") {
-        bind_data->min_zoom = bind_data->max_zoom;
-    } else if (bind_data->min_zoom == 0) {
-        bind_data->min_zoom = CalculateMinZoom(
-            bind_data->bounds_minlon, bind_data->bounds_minlat,
-            bind_data->bounds_maxlon, bind_data->bounds_maxlat,
-            bind_data->max_zoom, bind_data->block_zoom);
-    }
-
-    // Clean up bind-time handles
-    OCTDestroyCoordinateTransformation(tx3857);
-    OCTDestroyCoordinateTransformation(tx4326);
-    OSRDestroySpatialReference(src_srs);
-    OSRDestroySpatialReference(merc_srs);
-    OSRDestroySpatialReference(wgs84_srs);
-    GDALClose(ds);
 
     // Define output schema
     // Column 1: block (UBIGINT) — QUADBIN cell ID
