@@ -187,6 +187,9 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
     std::atomic<bool> metadata_emitted{false};
     std::atomic<bool> finished{false};
 
+    // Gate: only one thread may enter the post-native phases (overviews + metadata)
+    std::atomic<bool> post_native_claimed{false};
+
     // Whether we need overviews at all
     bool has_overviews = false;
 
@@ -1171,7 +1174,20 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         return;
     }
 
-    // ── Phase 2: Overview tiles (single-threaded, only one thread gets here) ──
+    // ── Gate: only one thread may enter Phases 2+3 ──
+    // When all native tiles are exhausted, multiple threads reach this point.
+    // Overviews use a single GDAL handle (not thread-safe) and metadata must
+    // be emitted exactly once after all tiles are counted.
+    {
+        bool expected = false;
+        if (!state.post_native_claimed.compare_exchange_strong(expected, true)) {
+            // Another thread owns Phases 2+3; this thread is done
+            output.SetCardinality(0);
+            return;
+        }
+    }
+
+    // ── Phase 2: Overview tiles (single-threaded, guarded by post_native_claimed) ──
     if (state.has_overviews && !state.overviews_built) {
         // Process overview frames bottom-up (highest zoom first)
         // Sort by zoom descending so children are processed before parents
