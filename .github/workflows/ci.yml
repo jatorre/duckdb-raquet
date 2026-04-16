@@ -28,9 +28,10 @@ jobs:
 
     - name: Run SQL tests
       run: |
-        make test_sql
+        make test
 
     - name: Upload build artifacts
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: raquet-linux-amd64
@@ -57,9 +58,10 @@ jobs:
 
     - name: Run SQL tests
       run: |
-        make test_sql
+        make test
 
     - name: Upload build artifacts
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: raquet-macos
