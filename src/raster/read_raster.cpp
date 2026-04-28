@@ -303,8 +303,6 @@ static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *wkt_3857,
 static void WarpIntoTile(GDALDatasetH src_ds, GDALDatasetH tile_ds,
                           GDALResampleAlg resample, double nodata, bool has_nodata,
                           int overview_level = -1) {
-    char **warp_options_list = nullptr;
-
     GDALWarpOptions *wo = GDALCreateWarpOptions();
     wo->hSrcDS = src_ds;
     wo->hDstDS = tile_ds;
@@ -328,19 +326,21 @@ static void WarpIntoTile(GDALDatasetH src_ds, GDALDatasetH tile_ds,
         }
     }
 
-    // Set overview level if specified
+    // Build transformer options. OVERVIEW_LEVEL belongs on the transformer
+    // (consumed by GDALCreateGenImgProjTransformer2 as SRC_OVERVIEW_LEVEL),
+    // not on GDALWarpOptions::papszWarpOptions.
+    char **transformer_options = nullptr;
     if (overview_level >= 0) {
         char ovr_str[32];
         snprintf(ovr_str, sizeof(ovr_str), "%d", overview_level);
-        warp_options_list = CSLSetNameValue(warp_options_list, "OVERVIEW_LEVEL", ovr_str);
+        transformer_options = CSLSetNameValue(transformer_options, "SRC_OVERVIEW_LEVEL", ovr_str);
     }
 
-    // Create coordinate transformation
-    wo->pTransformerArg = GDALCreateGenImgProjTransformer(src_ds, nullptr,
-                                                           tile_ds, nullptr, TRUE, 0, 1);
+    // Create coordinate transformation (v2 form so SRC_OVERVIEW_LEVEL is honored)
+    wo->pTransformerArg = GDALCreateGenImgProjTransformer2(src_ds, tile_ds, transformer_options);
+    CSLDestroy(transformer_options);
     if (!wo->pTransformerArg) {
         GDALDestroyWarpOptions(wo);
-        CSLDestroy(warp_options_list);
         throw IOException("Failed to create image projection transformer");
     }
     wo->pfnTransformer = GDALGenImgProjTransform;
@@ -350,7 +350,6 @@ static void WarpIntoTile(GDALDatasetH src_ds, GDALDatasetH tile_ds,
     if (err != CE_None) {
         GDALDestroyGenImgProjTransformer(wo->pTransformerArg);
         GDALDestroyWarpOptions(wo);
-        CSLDestroy(warp_options_list);
         throw IOException("Warp initialization failed");
     }
 
@@ -361,7 +360,6 @@ static void WarpIntoTile(GDALDatasetH src_ds, GDALDatasetH tile_ds,
     GDALDestroyGenImgProjTransformer(wo->pTransformerArg);
     wo->pTransformerArg = nullptr;
     GDALDestroyWarpOptions(wo);
-    CSLDestroy(warp_options_list);
 
     if (err != CE_None) {
         throw IOException("Warp execution failed for tile");
