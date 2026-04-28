@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace duckdb {
@@ -196,6 +197,11 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
     std::atomic<int> total_blocks{0};
     std::atomic<bool> metadata_emitted{false};
     std::atomic<bool> finished{false};
+
+    // Phase 1 completion counter — incremented after each native tile is fully
+    // processed (emitted or skipped-empty). Used by the post-native gate winner
+    // to wait for in-flight workers before reading total_blocks for metadata.
+    std::atomic<idx_t> phase1_finished{0};
 
     // Gate: only one thread may enter the post-native phases (overviews + metadata)
     std::atomic<bool> post_native_claimed{false};
@@ -1253,6 +1259,9 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
 
         GDALClose(tile_ds);
         VSIUnlink(tile_path.c_str());
+
+        // Mark this tile as fully processed (emitted or skipped-empty)
+        state.phase1_finished.fetch_add(1, std::memory_order_release);
     }
 
     // If we emitted rows from native tiles, return them
@@ -1272,6 +1281,13 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             output.SetCardinality(0);
             return;
         }
+    }
+
+    // Wait for any sibling threads still finishing their last Phase 1 tile.
+    // The queue may be drained while their state.total_blocks++ has not yet
+    // happened, which would otherwise let metadata under-report num_blocks.
+    while (state.phase1_finished.load(std::memory_order_acquire) < state.native_tiles.size()) {
+        std::this_thread::yield();
     }
 
     // ── Phase 2: Overview tiles (single-threaded, guarded by post_native_claimed) ──
