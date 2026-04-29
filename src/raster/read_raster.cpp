@@ -194,28 +194,32 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
     std::mutex tile_mutex;
     idx_t next_tile_idx = 0;
 
-    // Phase 2: Overview frames (warped single-threaded, then staged for parallel drain)
+    // Phase 2 work queue: every thread pulls overview frames from this list
+    // via next_overview_idx and warps them with its own per-thread GDAL handle
+    // (local.src_ds), then pushes the result into overview_results under a
+    // mutex. The last thread to finish publishes phase2_staged; afterwards
+    // any thread can drain overview_results lock-free.
     std::vector<OverviewFrame> overview_frames;
+    std::atomic<idx_t> next_overview_idx{0};            // work pull pointer
+    std::atomic<idx_t> overview_frames_processed{0};    // completion counter
 
-    // Phase 2 results staged by the gate winner during overview warping, then
-    // drained lock-free by any thread up to STANDARD_VECTOR_SIZE per Execute
-    // call. This is what avoids the silent row-cap drop that occurred when
-    // Phase 2 emitted directly into the output DataChunk in a single call
-    // (overview tiles beyond max_rows were warped and discarded; for Germany
-    // with its ~13k overview tiles, ~11k were lost).
-    //
-    // overview_results is filled by exactly one thread (the gate winner) before
-    // phase2_staged is set, so subsequent reads are race-free; .size() is a
-    // plain read after the release-store on phase2_staged.
+    // One-shot Phase 2 init: the first thread to enter post-native work waits
+    // for Phase 1 stragglers, then publishes phase2_init_done so siblings can
+    // start pulling from the queue.
+    std::atomic<bool> phase2_init_claimed{false};
+    std::atomic<bool> phase2_init_done{false};
+
+    // Phase 2 staged results — filled in parallel by every Phase 2 worker
+    // (push_back guarded by overview_results_mutex), drained lock-free via
+    // overview_drain_idx after phase2_staged is set. Staging into a queue
+    // instead of writing directly into the output DataChunk is what avoids
+    // the silent row-cap drop that capped Phase 2 emission at
+    // STANDARD_VECTOR_SIZE rows (for Germany at default zoom: ~11k overview
+    // tiles were silently lost).
     std::vector<OverviewResult> overview_results;
+    std::mutex overview_results_mutex;
     std::atomic<idx_t> overview_drain_idx{0};
     std::atomic<bool> phase2_staged{false};
-
-    // GDAL handles for overview phase (single-threaded only)
-    GDALDatasetH overview_src_ds = nullptr;
-    GDALDriverH overview_driver = nullptr;
-    char *overview_wkt = nullptr;
-    OGRSpatialReferenceH overview_srs = nullptr;
 
     // Shared config
     GDALResampleAlg source_resampling = GRA_NearestNeighbour;
@@ -229,12 +233,9 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
     std::atomic<bool> finished{false};
 
     // Phase 1 completion counter — incremented after each native tile is fully
-    // processed (emitted or skipped-empty). Used by the post-native gate winner
-    // to wait for in-flight workers before reading total_blocks for metadata.
+    // processed (emitted or skipped-empty). Used by the Phase 2 init winner
+    // to wait for in-flight workers before any thread reads total_blocks.
     std::atomic<idx_t> phase1_finished{0};
-
-    // Gate: only one thread may enter the post-native phases (overviews + metadata)
-    std::atomic<bool> post_native_claimed{false};
 
     // Whether we need overviews at all
     bool has_overviews = false;
@@ -243,11 +244,6 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
         return GlobalTableFunctionState::MAX_THREADS;
     }
 
-    ~ReadRasterGlobalState() {
-        if (overview_wkt) CPLFree(overview_wkt);
-        if (overview_srs) OSRDestroySpatialReference(overview_srs);
-        if (overview_src_ds) GDALClose(overview_src_ds);
-    }
 };
 
 // ─────────────────────────────────────────────
@@ -1130,20 +1126,10 @@ static unique_ptr<GlobalTableFunctionState> ReadRasterInitGlobal(ClientContext &
         bind_data.bounds_maxlon, bind_data.bounds_maxlat,
         bind_data.max_zoom);
 
-    // Build overview frames if needed (processed single-threaded after native tiles)
+    // Build overview frames if needed. Each thread will warp its share using
+    // its own per-thread GDAL handle (local.src_ds), so no global handle is
+    // opened here.
     if (state->has_overviews) {
-        // Open GDAL dataset for overview phase
-        state->overview_src_ds = OpenGDALDataset(bind_data.filename);
-        if (!state->overview_src_ds) {
-            throw IOException("Failed to open raster file for overviews: %s", bind_data.filename);
-        }
-        state->overview_driver = GDALGetDriverByName("GTiff");
-        state->overview_srs = OSRNewSpatialReference(nullptr);
-        OSRImportFromEPSG(state->overview_srs, 3857);
-        OSRExportToWkt(state->overview_srs, &state->overview_wkt);
-
-        // Build overview frames for zoom levels below max_zoom
-        // Process from min_zoom up to max_zoom-1
         for (int z = bind_data.min_zoom; z < bind_data.max_zoom; z++) {
             auto tiles_at_zoom = EnumerateTiles(
                 bind_data.bounds_minlon, bind_data.bounds_minlat,
@@ -1290,106 +1276,130 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         return;
     }
 
-    // ── Phase 2 staging: gate winner warps every overview frame into the
-    //    overview_results queue. All other threads return 0 until the queue is
-    //    populated, then any thread may drain it. Staging happens at most once
-    //    per query; afterwards phase2_staged stays true for the rest of the
-    //    pipeline.
+    // ── Phase 2 staging (parallel): every thread pulls overview frames from
+    //    state.overview_frames via next_overview_idx and warps them with its
+    //    own per-thread GDAL handle (local.src_ds). Non-empty results are
+    //    pushed into state.overview_results under a brief mutex; the last
+    //    thread to finish (overview_frames_processed == size) publishes
+    //    phase2_staged. Threads that arrive after staging is already in
+    //    progress simply join the work pull. Threads that arrive after
+    //    staging is finished skip ahead to the drain block.
     if (!state.phase2_staged.load(std::memory_order_acquire)) {
-        bool expected = false;
-        if (!state.post_native_claimed.compare_exchange_strong(expected, true)) {
-            // Another thread is already staging Phase 2. Yield and retry.
+        // One-shot Phase 2 init: wait for Phase 1 stragglers exactly once so
+        // total_blocks reflects every emitted native tile before any thread
+        // reads it. The init winner also short-circuits phase2_staged when
+        // there are no overview frames at all.
+        if (!state.phase2_init_done.load(std::memory_order_acquire)) {
+            bool expected = false;
+            if (state.phase2_init_claimed.compare_exchange_strong(expected, true)) {
+                while (state.phase1_finished.load(std::memory_order_acquire) < state.native_tiles.size()) {
+                    std::this_thread::yield();
+                }
+                if (state.overview_frames.empty()) {
+                    // Nothing to stage; skip straight to metadata.
+                    state.phase2_staged.store(true, std::memory_order_release);
+                } else {
+                    state.overview_results.reserve(state.overview_frames.size());
+                }
+                state.phase2_init_done.store(true, std::memory_order_release);
+            } else {
+                while (!state.phase2_init_done.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            }
+        }
+
+        // Pull-and-warp loop. Every thread runs this; fetch_add hands out
+        // non-overlapping work indices. When a thread can't get more work
+        // it falls through; the thread that increments overview_frames_processed
+        // to the total publishes phase2_staged.
+        const idx_t total_frames = state.overview_frames.size();
+        while (true) {
+            idx_t my_idx = state.next_overview_idx.fetch_add(1, std::memory_order_acq_rel);
+            if (my_idx >= total_frames) {
+                break;
+            }
+
+            auto &frame = state.overview_frames[my_idx];
+
+            std::string ovr_path;
+            GDALDatasetH tile_ds = CreateTileDataset(
+                local.gtiff_driver, local.web_mercator_wkt,
+                frame.tile, bind_data.block_size,
+                bind_data.raster_band_count, bind_data.gdal_dtype,
+                state.nodata_value, state.has_nodata, ovr_path);
+
+            // Try COG overview fast path: read directly from a source overview
+            // level with a matching reduction factor instead of re-warping
+            // from the base resolution. Geometrically valid for any source
+            // CRS — the destination tile is in Web Mercator regardless of
+            // source, and the warper reprojects from the chosen overview just
+            // as it would from the base. The tolerance check on the reduction
+            // factor is what validates suitability.
+            bool used_cog = false;
+            if (bind_data.overview_count > 0) {
+                int zoom_diff = bind_data.max_zoom - frame.tile.z;
+                int reduction_factor = 1 << zoom_diff;
+                GDALRasterBandH src_band = GDALGetRasterBand(local.src_ds, 1);
+                int src_xsize = GDALGetRasterBandXSize(src_band);
+                for (int i = 0; i < bind_data.overview_count; i++) {
+                    GDALRasterBandH ovr = GDALGetOverview(src_band, i);
+                    if (ovr) {
+                        int ovr_xsize = GDALGetRasterBandXSize(ovr);
+                        double ovr_reduction = static_cast<double>(src_xsize) / ovr_xsize;
+                        if (std::abs(ovr_reduction - reduction_factor) / reduction_factor < 0.1) {
+                            WarpIntoTile(local.src_ds, tile_ds, GRA_NearestNeighbour,
+                                         state.nodata_value, state.has_nodata, i);
+                            used_cog = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!used_cog) {
+                // Fallback: warp from base resolution
+                WarpIntoTile(local.src_ds, tile_ds, GRA_Average,
+                             state.nodata_value, state.has_nodata);
+            }
+
+            bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
+
+            if (!empty) {
+                auto tile_data = ReadAndCompressBands(
+                    tile_ds, bind_data.compression, bind_data.compression_quality,
+                    bind_data.band_layout, bind_data.statistics,
+                    bind_data.raquet_dtype, state.has_nodata, state.nodata_value);
+
+                uint64_t block = quadbin::tile_to_cell(frame.tile.x, frame.tile.y, frame.tile.z);
+                {
+                    std::lock_guard<std::mutex> lock(state.overview_results_mutex);
+                    state.overview_results.push_back({block, std::move(tile_data)});
+                }
+                state.total_blocks++;
+            }
+
+            GDALClose(tile_ds);
+            VSIUnlink(ovr_path.c_str());
+
+            idx_t completed = state.overview_frames_processed.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (completed >= total_frames) {
+                // We finished the last overview tile — publish the staged queue.
+                state.phase2_staged.store(true, std::memory_order_release);
+            }
+        }
+
+        // After the work-pull loop: phase2_staged is either set already (we
+        // were the last finisher, or another thread was) or still pending
+        // because some sibling is still warping its current tile. In the
+        // latter case yield and let DuckDB call us back; we'll fall through
+        // to the drain on the next entry.
+        if (!state.phase2_staged.load(std::memory_order_acquire)) {
             std::this_thread::yield();
             output.SetCardinality(0);
             return;
         }
-
-        // Wait for any sibling threads still finishing their last Phase 1 tile,
-        // so that state.total_blocks reflects every emitted native tile before
-        // we add the overview contribution and (later) emit metadata.
-        while (state.phase1_finished.load(std::memory_order_acquire) < state.native_tiles.size()) {
-            std::this_thread::yield();
-        }
-
-        if (state.has_overviews) {
-            // Process overview frames bottom-up (highest zoom first) so finer
-            // overviews are produced before coarser ones — relevant only if
-            // a future change ever reads from this queue dependently.
-            std::sort(state.overview_frames.begin(), state.overview_frames.end(),
-                      [](const OverviewFrame &a, const OverviewFrame &b) {
-                          return a.tile.z > b.tile.z;
-                      });
-
-            state.overview_results.reserve(state.overview_frames.size());
-
-            for (auto &frame : state.overview_frames) {
-                std::string ovr_path;
-                GDALDatasetH tile_ds = CreateTileDataset(
-                    state.overview_driver, state.overview_wkt,
-                    frame.tile, bind_data.block_size,
-                    bind_data.raster_band_count, bind_data.gdal_dtype,
-                    state.nodata_value, state.has_nodata, ovr_path);
-
-                // Try COG overview fast path: read directly from a source
-                // overview level with a matching reduction factor instead of
-                // re-warping from the base resolution. This is geometrically
-                // valid for any source CRS — the destination tile is in
-                // Web Mercator regardless of source, and the warper will
-                // reproject from the chosen overview just as it would from
-                // the base. The reduction-factor tolerance check below is
-                // what guarantees the chosen overview matches the requested
-                // zoom; src_is_web_mercator was over-restrictive and was
-                // causing UTM (and other non-WM) sources to fall through to
-                // the slow re-warp-from-base path even though their internal
-                // overview pyramids were perfectly usable.
-                bool used_cog = false;
-                if (bind_data.overview_count > 0) {
-                    int zoom_diff = bind_data.max_zoom - frame.tile.z;
-                    int reduction_factor = 1 << zoom_diff;
-                    GDALRasterBandH src_band = GDALGetRasterBand(state.overview_src_ds, 1);
-                    int src_xsize = GDALGetRasterBandXSize(src_band);
-                    for (int i = 0; i < bind_data.overview_count; i++) {
-                        GDALRasterBandH ovr = GDALGetOverview(src_band, i);
-                        if (ovr) {
-                            int ovr_xsize = GDALGetRasterBandXSize(ovr);
-                            double ovr_reduction = static_cast<double>(src_xsize) / ovr_xsize;
-                            if (std::abs(ovr_reduction - reduction_factor) / reduction_factor < 0.1) {
-                                WarpIntoTile(state.overview_src_ds, tile_ds, GRA_NearestNeighbour,
-                                             state.nodata_value, state.has_nodata, i);
-                                used_cog = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (!used_cog) {
-                    // Fallback: warp from base resolution
-                    WarpIntoTile(state.overview_src_ds, tile_ds, GRA_Average,
-                                 state.nodata_value, state.has_nodata);
-                }
-
-                bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
-
-                if (!empty) {
-                    auto tile_data = ReadAndCompressBands(
-                        tile_ds, bind_data.compression, bind_data.compression_quality,
-                        bind_data.band_layout, bind_data.statistics,
-                        bind_data.raquet_dtype, state.has_nodata, state.nodata_value);
-
-                    uint64_t block = quadbin::tile_to_cell(frame.tile.x, frame.tile.y, frame.tile.z);
-                    state.overview_results.push_back({block, std::move(tile_data)});
-                    state.total_blocks++;
-                }
-
-                GDALClose(tile_ds);
-                VSIUnlink(ovr_path.c_str());
-            }
-        }
-
-        // Publish the staged queue. After this point, any thread may drain.
-        state.phase2_staged.store(true, std::memory_order_release);
-        // Fall through into the drain block below — this thread has work to do.
+        // Fall through to drain.
     }
 
     // ── Phase 2 drain: any thread can pull from the staged queue, capped at
