@@ -152,6 +152,23 @@ struct ReadRasterBindData : public TableFunctionData {
 };
 
 // ─────────────────────────────────────────────
+// Result from reading and compressing bands
+// ─────────────────────────────────────────────
+struct TileData {
+    std::vector<std::vector<uint8_t>> compressed;  // compressed band buffers
+    std::vector<raquet::BandStats> stats;           // per-band statistics (empty if not requested)
+};
+
+// One overview tile fully prepared for emission. Phase 2 stages these into a
+// shared queue (single-producer, multi-consumer) instead of writing directly
+// to the output DataChunk, so emission can span multiple Execute calls
+// without losing tiles past STANDARD_VECTOR_SIZE.
+struct OverviewResult {
+    uint64_t block;
+    TileData tile_data;
+};
+
+// ─────────────────────────────────────────────
 // Overview tile (flat list, processed single-threaded)
 // ─────────────────────────────────────────────
 struct OverviewFrame {
@@ -167,9 +184,22 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
     std::mutex tile_mutex;
     idx_t next_tile_idx = 0;
 
-    // Phase 2: Overview frames (single-threaded, after all native tiles done)
+    // Phase 2: Overview frames (warped single-threaded, then staged for parallel drain)
     std::vector<OverviewFrame> overview_frames;
-    bool overviews_built = false;
+
+    // Phase 2 results staged by the gate winner during overview warping, then
+    // drained lock-free by any thread up to STANDARD_VECTOR_SIZE per Execute
+    // call. This is what avoids the silent row-cap drop that occurred when
+    // Phase 2 emitted directly into the output DataChunk in a single call
+    // (overview tiles beyond max_rows were warped and discarded; for Germany
+    // with its ~13k overview tiles, ~11k were lost).
+    //
+    // overview_results is filled by exactly one thread (the gate winner) before
+    // phase2_staged is set, so subsequent reads are race-free; .size() is a
+    // plain read after the release-store on phase2_staged.
+    std::vector<OverviewResult> overview_results;
+    std::atomic<idx_t> overview_drain_idx{0};
+    std::atomic<bool> phase2_staged{false};
 
     // GDAL handles for overview phase (single-threaded only)
     GDALDatasetH overview_src_ds = nullptr;
@@ -399,14 +429,6 @@ static bool IsTileEmpty(GDALDatasetH ds, double nodata, bool has_nodata) {
     }
     return true;
 }
-
-// ─────────────────────────────────────────────
-// Result from reading and compressing bands
-// ─────────────────────────────────────────────
-struct TileData {
-    std::vector<std::vector<uint8_t>> compressed;  // compressed band buffers
-    std::vector<raquet::BandStats> stats;           // per-band statistics (empty if not requested)
-};
 
 // ─────────────────────────────────────────────
 // Helper: Read and compress band data from a warped tile dataset
@@ -1181,89 +1203,118 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         return;
     }
 
-    // ── Gate: only one thread may enter Phases 2+3 ──
-    // When all native tiles are exhausted, multiple threads reach this point.
-    // Overviews use a single GDAL handle (not thread-safe) and metadata must
-    // be emitted exactly once after all tiles are counted.
-    {
+    // ── Phase 2 staging: gate winner warps every overview frame into the
+    //    overview_results queue. All other threads return 0 until the queue is
+    //    populated, then any thread may drain it. Staging happens at most once
+    //    per query; afterwards phase2_staged stays true for the rest of the
+    //    pipeline.
+    if (!state.phase2_staged.load(std::memory_order_acquire)) {
         bool expected = false;
         if (!state.post_native_claimed.compare_exchange_strong(expected, true)) {
-            // Another thread owns Phases 2+3; this thread is done
+            // Another thread is already staging Phase 2. Yield and retry.
+            std::this_thread::yield();
             output.SetCardinality(0);
             return;
         }
-    }
 
-    // Wait for any sibling threads still finishing their last Phase 1 tile.
-    // The queue may be drained while their state.total_blocks++ has not yet
-    // happened, which would otherwise let metadata under-report num_blocks.
-    while (state.phase1_finished.load(std::memory_order_acquire) < state.native_tiles.size()) {
-        std::this_thread::yield();
-    }
+        // Wait for any sibling threads still finishing their last Phase 1 tile,
+        // so that state.total_blocks reflects every emitted native tile before
+        // we add the overview contribution and (later) emit metadata.
+        while (state.phase1_finished.load(std::memory_order_acquire) < state.native_tiles.size()) {
+            std::this_thread::yield();
+        }
 
-    // ── Phase 2: Overview tiles (single-threaded, guarded by post_native_claimed) ──
-    if (state.has_overviews && !state.overviews_built) {
-        // Process overview frames bottom-up (highest zoom first)
-        // Sort by zoom descending so children are processed before parents
-        std::sort(state.overview_frames.begin(), state.overview_frames.end(),
-                  [](const OverviewFrame &a, const OverviewFrame &b) {
-                      return a.tile.z > b.tile.z;
-                  });
+        if (state.has_overviews) {
+            // Process overview frames bottom-up (highest zoom first) so finer
+            // overviews are produced before coarser ones — relevant only if
+            // a future change ever reads from this queue dependently.
+            std::sort(state.overview_frames.begin(), state.overview_frames.end(),
+                      [](const OverviewFrame &a, const OverviewFrame &b) {
+                          return a.tile.z > b.tile.z;
+                      });
 
-        for (auto &frame : state.overview_frames) {
-            std::string ovr_path;
-            GDALDatasetH tile_ds = CreateTileDataset(
-                state.overview_driver, state.overview_wkt,
-                frame.tile, bind_data.block_size,
-                bind_data.raster_band_count, bind_data.gdal_dtype,
-                state.nodata_value, state.has_nodata, ovr_path);
+            state.overview_results.reserve(state.overview_frames.size());
 
-            // Try COG overview first
-            bool used_cog = false;
-            if (bind_data.src_is_web_mercator && bind_data.overview_count > 0) {
-                int zoom_diff = bind_data.max_zoom - frame.tile.z;
-                int reduction_factor = 1 << zoom_diff;
-                GDALRasterBandH src_band = GDALGetRasterBand(state.overview_src_ds, 1);
-                int src_xsize = GDALGetRasterBandXSize(src_band);
-                for (int i = 0; i < bind_data.overview_count; i++) {
-                    GDALRasterBandH ovr = GDALGetOverview(src_band, i);
-                    if (ovr) {
-                        int ovr_xsize = GDALGetRasterBandXSize(ovr);
-                        double ovr_reduction = static_cast<double>(src_xsize) / ovr_xsize;
-                        if (std::abs(ovr_reduction - reduction_factor) / reduction_factor < 0.1) {
-                            WarpIntoTile(state.overview_src_ds, tile_ds, GRA_NearestNeighbour,
-                                         state.nodata_value, state.has_nodata, i);
-                            used_cog = true;
-                            break;
+            for (auto &frame : state.overview_frames) {
+                std::string ovr_path;
+                GDALDatasetH tile_ds = CreateTileDataset(
+                    state.overview_driver, state.overview_wkt,
+                    frame.tile, bind_data.block_size,
+                    bind_data.raster_band_count, bind_data.gdal_dtype,
+                    state.nodata_value, state.has_nodata, ovr_path);
+
+                // Try COG overview fast path first
+                bool used_cog = false;
+                if (bind_data.src_is_web_mercator && bind_data.overview_count > 0) {
+                    int zoom_diff = bind_data.max_zoom - frame.tile.z;
+                    int reduction_factor = 1 << zoom_diff;
+                    GDALRasterBandH src_band = GDALGetRasterBand(state.overview_src_ds, 1);
+                    int src_xsize = GDALGetRasterBandXSize(src_band);
+                    for (int i = 0; i < bind_data.overview_count; i++) {
+                        GDALRasterBandH ovr = GDALGetOverview(src_band, i);
+                        if (ovr) {
+                            int ovr_xsize = GDALGetRasterBandXSize(ovr);
+                            double ovr_reduction = static_cast<double>(src_xsize) / ovr_xsize;
+                            if (std::abs(ovr_reduction - reduction_factor) / reduction_factor < 0.1) {
+                                WarpIntoTile(state.overview_src_ds, tile_ds, GRA_NearestNeighbour,
+                                             state.nodata_value, state.has_nodata, i);
+                                used_cog = true;
+                                break;
+                            }
                         }
                     }
                 }
+
+                if (!used_cog) {
+                    // Fallback: warp from base resolution
+                    WarpIntoTile(state.overview_src_ds, tile_ds, GRA_Average,
+                                 state.nodata_value, state.has_nodata);
+                }
+
+                bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
+
+                if (!empty) {
+                    auto tile_data = ReadAndCompressBands(
+                        tile_ds, bind_data.compression, bind_data.compression_quality,
+                        bind_data.band_layout, bind_data.statistics,
+                        bind_data.raquet_dtype, state.has_nodata, state.nodata_value);
+
+                    uint64_t block = quadbin::tile_to_cell(frame.tile.x, frame.tile.y, frame.tile.z);
+                    state.overview_results.push_back({block, std::move(tile_data)});
+                    state.total_blocks++;
+                }
+
+                GDALClose(tile_ds);
+                VSIUnlink(ovr_path.c_str());
             }
-
-            if (!used_cog) {
-                // Warp from source at lower resolution
-                WarpIntoTile(state.overview_src_ds, tile_ds, GRA_Average,
-                             state.nodata_value, state.has_nodata);
-            }
-
-            bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
-
-            if (!empty && row_count < max_rows) {
-                auto tile_data = ReadAndCompressBands(
-                    tile_ds, bind_data.compression, bind_data.compression_quality,
-                    bind_data.band_layout, bind_data.statistics,
-                    bind_data.raquet_dtype, state.has_nodata, state.nodata_value);
-
-                uint64_t block = quadbin::tile_to_cell(frame.tile.x, frame.tile.y, frame.tile.z);
-                EmitTileRow(output, row_count, bind_data, block, tile_data);
-                state.total_blocks++;
-                row_count++;
-            }
-
-            GDALClose(tile_ds);
-            VSIUnlink(ovr_path.c_str());
         }
-        state.overviews_built = true;
+
+        // Publish the staged queue. After this point, any thread may drain.
+        state.phase2_staged.store(true, std::memory_order_release);
+        // Fall through into the drain block below — this thread has work to do.
+    }
+
+    // ── Phase 2 drain: any thread can pull from the staged queue, capped at
+    //    max_rows - 1 so there's still room for the metadata row in this chunk
+    //    if the queue runs out here. Lock-free fetch_add: threads may
+    //    over-increment past .size() (those return without emitting), which is
+    //    fine — we only need >= size() to mean "drained" for the metadata gate.
+    const idx_t overview_total = state.overview_results.size();
+    while (row_count + 1 < max_rows) {
+        idx_t my_idx = state.overview_drain_idx.fetch_add(1, std::memory_order_acq_rel);
+        if (my_idx >= overview_total) {
+            break;
+        }
+        auto &result = state.overview_results[my_idx];
+        EmitTileRow(output, row_count, bind_data, result.block, result.tile_data);
+        row_count++;
+    }
+
+    // If the overview queue still has tiles to drain, leave metadata for a
+    // later Execute call.
+    if (state.overview_drain_idx.load(std::memory_order_acquire) < overview_total) {
+        output.SetCardinality(row_count);
+        return;
     }
 
     // ── Phase 3: Emit metadata row (exactly once, thread-safe) ──
