@@ -1243,9 +1243,20 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                     bind_data.raster_band_count, bind_data.gdal_dtype,
                     state.nodata_value, state.has_nodata, ovr_path);
 
-                // Try COG overview fast path first
+                // Try COG overview fast path: read directly from a source
+                // overview level with a matching reduction factor instead of
+                // re-warping from the base resolution. This is geometrically
+                // valid for any source CRS — the destination tile is in
+                // Web Mercator regardless of source, and the warper will
+                // reproject from the chosen overview just as it would from
+                // the base. The reduction-factor tolerance check below is
+                // what guarantees the chosen overview matches the requested
+                // zoom; src_is_web_mercator was over-restrictive and was
+                // causing UTM (and other non-WM) sources to fall through to
+                // the slow re-warp-from-base path even though their internal
+                // overview pyramids were perfectly usable.
                 bool used_cog = false;
-                if (bind_data.src_is_web_mercator && bind_data.overview_count > 0) {
+                if (bind_data.overview_count > 0) {
                     int zoom_diff = bind_data.max_zoom - frame.tile.z;
                     int reduction_factor = 1 << zoom_diff;
                     GDALRasterBandH src_band = GDALGetRasterBand(state.overview_src_ds, 1);
