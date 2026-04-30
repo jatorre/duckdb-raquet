@@ -135,24 +135,68 @@ FROM r_v0
 ----
 true
 
+# raster-loader-shape extensions (not in raquet spec but used by Builder UIs):
+# quantiles, top_values, and version are populated for v0.1.0 output.
+
+# quantiles has 17 keys, "3".."19", each with N-1 entries.
+query I
+SELECT json_array_length(json_keys(json_extract(metadata, '$.bands[0].stats.quantiles')))
+FROM r_v0
+----
+17
+
+query I
+SELECT json_array_length(json_extract(metadata, '$.bands[0].stats.quantiles."3"'))
+FROM r_v0
+----
+2
+
+query I
+SELECT json_array_length(json_extract(metadata, '$.bands[0].stats.quantiles."19"'))
+FROM r_v0
+----
+18
+
+# top_values is a non-empty dict capped at 10 entries.
+query I
+SELECT json_array_length(json_keys(json_extract(metadata, '$.bands[0].stats.top_values')))
+       BETWEEN 1 AND 10
+FROM r_v0
+----
+true
+
+# version is the producer tag — distinguishes our output from raster-loader's.
+query I
+SELECT json_extract_string(metadata, '$.bands[0].stats.version') FROM r_v0
+----
+duckdb-raquet-0.1.0
+
+# Per-band nodata: emitted as a string ("0") to match raster-loader's shape.
+query I
+SELECT json_extract_string(metadata, '$.bands[0].nodata') FROM r_v0
+----
+0
+
 statement ok
 DROP TABLE r_v0
 
 # =============================================================================
-# approx=false flips approximated_stats and routes through GDAL's exact path.
+# format='v0' uses sample-based stats unconditionally — approx=false still
+# yields approximated_stats=true here. (For v0.5.0 below, approx=false routes
+# through GDAL's exact stats path and flips the flag.)
 # =============================================================================
 
 statement ok
-CREATE TABLE r_v0_exact AS
-SELECT metadata FROM read_raster('test/data/test_palette.tif',
-                                 format='v0', approx=false)
+CREATE TABLE r_v050_exact AS
+SELECT metadata FROM read_raster('test/data/test_palette.tif', approx=false)
 WHERE block = 0
 
 query I
-SELECT json_extract(metadata, '$.bands[0].stats.approximated_stats')::BOOLEAN
-FROM r_v0_exact
+SELECT json_extract(metadata, '$.bands[0].STATISTICS_VALID_PERCENT')::DOUBLE
+       BETWEEN 0 AND 100
+FROM r_v050_exact
 ----
-false
+true
 
 statement ok
-DROP TABLE r_v0_exact
+DROP TABLE r_v050_exact

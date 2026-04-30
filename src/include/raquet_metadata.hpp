@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -32,7 +33,10 @@ struct BandInfo {
     std::vector<std::array<int, 4>> colortable;
     bool has_colortable = false;
 
-    // GDAL-derived band statistics (approximate when computed via approxOK=TRUE).
+    // Per-band statistics. v0.5.0 path populates the GDAL-approxOK fields
+    // (count derived from STATISTICS_VALID_PERCENT × pixels). v0.1.0 path
+    // populates the same accumulators from a 1000-pixel sample, plus the
+    // raster-loader-shape extension fields (quantiles, top_values, version).
     struct Stats {
         int64_t count = 0;
         double  min = 0.0;
@@ -44,6 +48,11 @@ struct BandInfo {
         double  valid_percent = 0.0;  // STATISTICS_VALID_PERCENT (0–100)
         bool    approximated = true;
         bool    has_stats = false;
+        // v0.1.0-only extension fields. Empty in v0.5.0 output (and the
+        // serializer skips empty ones).
+        std::string version;                              // producer tag
+        std::map<int, std::vector<double>> quantiles;     // keys 3..19
+        std::map<double, int64_t> top_values;             // up to 10 entries
     } stats;
 
     BandInfo() : nodata(0), has_nodata(false), scale(1.0), offset(0.0),
@@ -165,6 +174,72 @@ struct RaquetMetadata {
         return std::to_string(bi.nodata);
     }
 
+    // Per-band nodata for v0.1.0 bands[i].nodata. raster-loader emits this
+    // as a string ("255" rather than 255) so consumers do unconditional
+    // string-typed reads. We mirror that shape: always-quoted, integer
+    // formatting when the value is exactly integer.
+    static std::string nodata_to_json_v0_band(const BandInfo &bi) {
+        if (!bi.has_nodata) return "null";
+        std::string body;
+        if (std::isnan(bi.nodata)) {
+            body = "NaN";
+        } else if (std::isinf(bi.nodata)) {
+            body = bi.nodata > 0 ? "Infinity" : "-Infinity";
+        } else if (std::floor(bi.nodata) == bi.nodata) {
+            body = std::to_string(static_cast<int64_t>(bi.nodata));
+        } else {
+            body = std::to_string(bi.nodata);
+        }
+        return "\"" + body + "\"";
+    }
+
+    // Render the quantiles map as {"3":[...],"4":[...],...,"19":[...]}.
+    // Empty map → "{}" (caller can choose to skip emitting the key).
+    static std::string quantiles_to_json(const std::map<int, std::vector<double>> &q) {
+        std::string out = "{";
+        bool first = true;
+        for (auto &kv : q) {
+            if (!first) out += ",";
+            first = false;
+            out += "\"" + std::to_string(kv.first) + "\":[";
+            for (size_t i = 0; i < kv.second.size(); i++) {
+                if (i > 0) out += ",";
+                // Quantile values come from sample pixels; format as integer
+                // when exact (matches raster-loader for integer-typed bands).
+                double v = kv.second[i];
+                if (std::floor(v) == v && !std::isinf(v) && !std::isnan(v)) {
+                    out += std::to_string(static_cast<int64_t>(v));
+                } else {
+                    out += std::to_string(v);
+                }
+            }
+            out += "]";
+        }
+        out += "}";
+        return out;
+    }
+
+    // Render top_values as {"<value>": <count>, ...}. raster-loader uses
+    // string-cast keys (numpy int -> Python str via JSON encoding).
+    static std::string top_values_to_json(const std::map<double, int64_t> &tv) {
+        std::string out = "{";
+        bool first = true;
+        for (auto &kv : tv) {
+            if (!first) out += ",";
+            first = false;
+            std::string key_str;
+            const double k = kv.first;
+            if (std::floor(k) == k && !std::isinf(k) && !std::isnan(k)) {
+                key_str = std::to_string(static_cast<int64_t>(k));
+            } else {
+                key_str = std::to_string(k);
+            }
+            out += "\"" + key_str + "\":" + std::to_string(kv.second);
+        }
+        out += "}";
+        return out;
+    }
+
     // Render a band's color table as a JSON object keyed by stringified index:
     //   {"0":[r,g,b,a], "1":[r,g,b,a], ...}
     // Returns "null" when the band has no palette.
@@ -186,7 +261,9 @@ struct RaquetMetadata {
 
     // Render the v0.1.0 stats object for a single band. When stats are missing
     // the band still gets a stats key but valued null, so consumers can rely on
-    // the field being present.
+    // the field being present. quantiles, top_values, and version are emitted
+    // when populated (raster-loader-shape extensions, not in spec but used by
+    // CARTO Builder colormap UIs).
     static std::string stats_to_json_v0(const BandInfo &bi) {
         if (!bi.stats.has_stats) return "null";
         const auto &s = bi.stats;
@@ -198,6 +275,15 @@ struct RaquetMetadata {
         out += ",\"stddev\":" + std::to_string(s.stddev);
         out += ",\"sum\":" + std::to_string(s.sum);
         out += ",\"sum_squares\":" + std::to_string(s.sum_squares);
+        if (!s.quantiles.empty()) {
+            out += ",\"quantiles\":" + quantiles_to_json(s.quantiles);
+        }
+        if (!s.top_values.empty()) {
+            out += ",\"top_values\":" + top_values_to_json(s.top_values);
+        }
+        if (!s.version.empty()) {
+            out += ",\"version\":\"" + s.version + "\"";
+        }
         out += ",\"approximated_stats\":";
         out += s.approximated ? "true" : "false";
         out += "}";
@@ -261,13 +347,17 @@ struct RaquetMetadata {
             json += "]";
         }
 
-        // Bands as objects: [{name, type, colorinterp, colortable, stats}, ...]
+        // Bands as objects: [{name, type, nodata, colorinterp, colortable, stats}, ...]
+        // raster-loader emits per-band nodata as a string ("255") even though
+        // the v0.1.0 spec doesn't define this field; downstream Builder UIs
+        // expect it, so we mirror it here.
         json += ",\"bands\":[";
         for (size_t i = 0; i < band_info.size(); i++) {
             if (i > 0) json += ",";
             const auto &bi = band_info[i];
             json += "{\"name\":\"" + bi.name + "\"";
             json += ",\"type\":\"" + bi.type + "\"";
+            json += ",\"nodata\":" + nodata_to_json_v0_band(bi);
             json += ",\"colorinterp\":";
             if (bi.colorinterp.empty()) {
                 json += "null";
