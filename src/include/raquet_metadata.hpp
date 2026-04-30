@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -24,6 +26,25 @@ struct BandInfo {
     double offset;
     bool has_scale;
     bool has_offset;
+
+    // Palette color table (only populated when colorinterp == "palette").
+    // Each entry is RGBA in [0, 255].
+    std::vector<std::array<int, 4>> colortable;
+    bool has_colortable = false;
+
+    // GDAL-derived band statistics (approximate when computed via approxOK=TRUE).
+    struct Stats {
+        int64_t count = 0;
+        double  min = 0.0;
+        double  max = 0.0;
+        double  mean = 0.0;
+        double  stddev = 0.0;
+        double  sum = 0.0;
+        double  sum_squares = 0.0;
+        double  valid_percent = 0.0;  // STATISTICS_VALID_PERCENT (0–100)
+        bool    approximated = true;
+        bool    has_stats = false;
+    } stats;
 
     BandInfo() : nodata(0), has_nodata(false), scale(1.0), offset(0.0),
                  has_scale(false), has_offset(false) {}
@@ -53,6 +74,11 @@ struct RaquetMetadata {
     std::vector<std::string> tile_statistics_columns; // v0.5.0: which stats are available
     std::vector<BandInfo> band_info;  // Full band info including nodata
     std::vector<std::pair<std::string, std::string>> bands;  // name -> type (for backward compat)
+
+    // Source raster dimensions in source pixel space (GDAL XSize/YSize).
+    // Emitted as top-level "width"/"height" in both v0.1.0 and v0.5.0 metadata.
+    int width = 0;
+    int height = 0;
 
     // CF time dimension metadata (NetCDF)
     bool has_time = false;
@@ -129,11 +155,62 @@ struct RaquetMetadata {
     // Bounds in WGS84 (EPSG:4326) — used for metadata generation
     double bounds_minlon = 0, bounds_minlat = 0, bounds_maxlon = 0, bounds_maxlat = 0;
 
-    // Serialize to v0 (legacy) JSON metadata format
-    // Flat tiling fields, bands as arrays, nodata as separate array
+    // Serialize a single nodata value (or null), reused by v0.1.0 and v0.5.0.
+    static std::string nodata_to_json(const BandInfo &bi) {
+        if (!bi.has_nodata) return "null";
+        if (std::isnan(bi.nodata)) return "\"NaN\"";
+        if (std::isinf(bi.nodata)) {
+            return bi.nodata > 0 ? "\"Infinity\"" : "\"-Infinity\"";
+        }
+        return std::to_string(bi.nodata);
+    }
+
+    // Render a band's color table as a JSON object keyed by stringified index:
+    //   {"0":[r,g,b,a], "1":[r,g,b,a], ...}
+    // Returns "null" when the band has no palette.
+    static std::string colortable_to_json(const BandInfo &bi) {
+        if (!bi.has_colortable || bi.colortable.empty()) return "null";
+        std::string out = "{";
+        for (size_t i = 0; i < bi.colortable.size(); i++) {
+            if (i > 0) out += ",";
+            const auto &e = bi.colortable[i];
+            out += "\"" + std::to_string(i) + "\":["
+                + std::to_string(e[0]) + ","
+                + std::to_string(e[1]) + ","
+                + std::to_string(e[2]) + ","
+                + std::to_string(e[3]) + "]";
+        }
+        out += "}";
+        return out;
+    }
+
+    // Render the v0.1.0 stats object for a single band. When stats are missing
+    // the band still gets a stats key but valued null, so consumers can rely on
+    // the field being present.
+    static std::string stats_to_json_v0(const BandInfo &bi) {
+        if (!bi.stats.has_stats) return "null";
+        const auto &s = bi.stats;
+        std::string out = "{";
+        out += "\"count\":" + std::to_string(s.count);
+        out += ",\"min\":" + std::to_string(s.min);
+        out += ",\"max\":" + std::to_string(s.max);
+        out += ",\"mean\":" + std::to_string(s.mean);
+        out += ",\"stddev\":" + std::to_string(s.stddev);
+        out += ",\"sum\":" + std::to_string(s.sum);
+        out += ",\"sum_squares\":" + std::to_string(s.sum_squares);
+        out += ",\"approximated_stats\":";
+        out += s.approximated ? "true" : "false";
+        out += "}";
+        return out;
+    }
+
+    // Serialize to v0.1.0 JSON metadata format (raquet 0.2.5 parity).
+    // Top-level: version, compression, flat tiling fields, bounds, center,
+    // width, height, num_pixels, block_resolution, nodata (scalar or array),
+    // and bands as objects with {name, type, colorinterp, colortable, stats}.
     std::string to_json_v0() const {
         std::string json = "{";
-        json += "\"file_format\":\"raquet\"";
+        json += "\"version\":\"0.1.0\"";
 
         // Compression
         if (compression == "none" || compression.empty()) {
@@ -150,27 +227,56 @@ struct RaquetMetadata {
         json += ",\"pixel_resolution\":" + std::to_string(pixel_zoom);
         json += ",\"num_blocks\":" + std::to_string(num_blocks);
 
-        // Bands as array of arrays: [["name", "type"], ...]
+        // Bounds in WGS84 [W, S, E, N]
+        json += ",\"bounds\":[" +
+            std::to_string(bounds_minlon) + "," +
+            std::to_string(bounds_minlat) + "," +
+            std::to_string(bounds_maxlon) + "," +
+            std::to_string(bounds_maxlat) + "]";
+
+        // Center [lon, lat, min_zoom]
+        double center_lon = (bounds_minlon + bounds_maxlon) / 2.0;
+        double center_lat = (bounds_minlat + bounds_maxlat) / 2.0;
+        json += ",\"center\":[" +
+            std::to_string(center_lon) + "," +
+            std::to_string(center_lat) + "," +
+            std::to_string(min_zoom) + "]";
+
+        // Source raster dimensions
+        json += ",\"width\":" + std::to_string(width);
+        json += ",\"height\":" + std::to_string(height);
+        json += ",\"num_pixels\":" +
+            std::to_string(static_cast<int64_t>(width) * height);
+        json += ",\"block_resolution\":" + std::to_string(max_zoom);
+
+        // Nodata: scalar for single-band rasters, array otherwise (raquet 0.2.5 shape)
+        if (band_info.size() == 1) {
+            json += ",\"nodata\":" + nodata_to_json(band_info[0]);
+        } else {
+            json += ",\"nodata\":[";
+            for (size_t i = 0; i < band_info.size(); i++) {
+                if (i > 0) json += ",";
+                json += nodata_to_json(band_info[i]);
+            }
+            json += "]";
+        }
+
+        // Bands as objects: [{name, type, colorinterp, colortable, stats}, ...]
         json += ",\"bands\":[";
         for (size_t i = 0; i < band_info.size(); i++) {
             if (i > 0) json += ",";
-            json += "[\"" + band_info[i].name + "\",\"" + band_info[i].type + "\"]";
-        }
-        json += "]";
-
-        // Nodata as separate top-level array
-        json += ",\"nodata\":[";
-        for (size_t i = 0; i < band_info.size(); i++) {
-            if (i > 0) json += ",";
-            if (band_info[i].has_nodata) {
-                if (std::isnan(band_info[i].nodata)) {
-                    json += "null"; // v0 doesn't support NaN string convention
-                } else {
-                    json += std::to_string(band_info[i].nodata);
-                }
-            } else {
+            const auto &bi = band_info[i];
+            json += "{\"name\":\"" + bi.name + "\"";
+            json += ",\"type\":\"" + bi.type + "\"";
+            json += ",\"colorinterp\":";
+            if (bi.colorinterp.empty()) {
                 json += "null";
+            } else {
+                json += "\"" + bi.colorinterp + "\"";
             }
+            json += ",\"colortable\":" + colortable_to_json(bi);
+            json += ",\"stats\":" + stats_to_json_v0(bi);
+            json += "}";
         }
         json += "]";
 
@@ -192,6 +298,10 @@ struct RaquetMetadata {
             std::to_string(bounds_maxlon) + "," +
             std::to_string(bounds_maxlat) + "]";
         json += ",\"bounds_crs\":\"EPSG:4326\"";
+
+        // Source raster dimensions (v0.5.0 spec top-level fields)
+        json += ",\"width\":" + std::to_string(width);
+        json += ",\"height\":" + std::to_string(height);
 
         // Compression
         if (compression == "none" || compression.empty()) {
@@ -253,6 +363,17 @@ struct RaquetMetadata {
             }
             if (bi.has_offset) {
                 json += ",\"offset\":" + std::to_string(bi.offset);
+            }
+            if (bi.has_colortable && !bi.colortable.empty()) {
+                json += ",\"colortable\":" + colortable_to_json(bi);
+            }
+            if (bi.stats.has_stats) {
+                const auto &s = bi.stats;
+                json += ",\"STATISTICS_MINIMUM\":" + std::to_string(s.min);
+                json += ",\"STATISTICS_MAXIMUM\":" + std::to_string(s.max);
+                json += ",\"STATISTICS_MEAN\":" + std::to_string(s.mean);
+                json += ",\"STATISTICS_STDDEV\":" + std::to_string(s.stddev);
+                json += ",\"STATISTICS_VALID_PERCENT\":" + std::to_string(s.valid_percent);
             }
             json += "}";
         }
@@ -473,9 +594,76 @@ inline void extract_json_number_array(const std::string &json, const std::string
     }
 }
 
-// Parse bands array from metadata JSON (handles both v0 and v0.5.0 formats)
-// v0: bands is array of arrays [["name", "type"], ...] with separate "nodata" array
-// v0.5.0: bands is array of objects [{"name": ..., "type": ..., "nodata": ...}, ...]
+// Parse a colortable object: {"0":[r,g,b,a], "1":[r,g,b,a], ...}.
+// The serializer emits entries in order, so we just walk RGBA arrays sequentially.
+// Returns an empty vector when the key is missing or the value is null.
+inline std::vector<std::array<int, 4>> parse_colortable(const std::string &band_json) {
+    std::vector<std::array<int, 4>> out;
+    std::string obj = extract_json_object(band_json, "colortable");
+    if (obj.empty()) return out;
+
+    size_t pos = 0;
+    while (pos < obj.size()) {
+        size_t lb = obj.find('[', pos);
+        if (lb == std::string::npos) break;
+        size_t rb = obj.find(']', lb);
+        if (rb == std::string::npos) break;
+        std::string inner = obj.substr(lb + 1, rb - lb - 1);
+        std::array<int, 4> rgba{0, 0, 0, 255};
+        size_t p = 0;
+        int i = 0;
+        while (p < inner.size() && i < 4) {
+            while (p < inner.size() && (inner[p] == ' ' || inner[p] == ',')) p++;
+            size_t end = p;
+            while (end < inner.size() && inner[end] != ',' && inner[end] != ' ') end++;
+            if (end > p) {
+                try { rgba[i] = std::stoi(inner.substr(p, end - p)); } catch (...) {}
+            }
+            p = end;
+            i++;
+        }
+        out.push_back(rgba);
+        pos = rb + 1;
+    }
+    return out;
+}
+
+// Parse a v0.1.0 stats object: {"count":...,"min":...,"max":...,...}.
+inline BandInfo::Stats parse_stats_v0(const std::string &band_json) {
+    BandInfo::Stats s;
+    std::string obj = extract_json_object(band_json, "stats");
+    if (obj.empty()) return s;
+
+    s.count       = static_cast<int64_t>(extract_json_double(obj, "count", 0));
+    s.min         = extract_json_double(obj, "min", 0);
+    s.max         = extract_json_double(obj, "max", 0);
+    s.mean        = extract_json_double(obj, "mean", 0);
+    s.stddev      = extract_json_double(obj, "stddev", 0);
+    s.sum         = extract_json_double(obj, "sum", 0);
+    s.sum_squares = extract_json_double(obj, "sum_squares", 0);
+    std::string approx = extract_json_string(obj, "approximated_stats");
+    s.approximated = (approx == "true" || approx == "1");
+    s.has_stats = true;
+    return s;
+}
+
+// Parse v0.5.0 STATISTICS_* keys from a band object (flat top-level fields).
+inline BandInfo::Stats parse_stats_v05(const std::string &band_json) {
+    BandInfo::Stats s;
+    if (!extract_json_has_value(band_json, "STATISTICS_MINIMUM")) return s;
+    s.min          = extract_json_double(band_json, "STATISTICS_MINIMUM", 0);
+    s.max          = extract_json_double(band_json, "STATISTICS_MAXIMUM", 0);
+    s.mean         = extract_json_double(band_json, "STATISTICS_MEAN", 0);
+    s.stddev       = extract_json_double(band_json, "STATISTICS_STDDEV", 0);
+    s.valid_percent = extract_json_double(band_json, "STATISTICS_VALID_PERCENT", 0);
+    s.has_stats    = true;
+    return s;
+}
+
+// Parse bands array from metadata JSON (handles legacy v0 arrays, new v0.1.0
+// objects, and v0.5.0 objects — they share the object branch).
+// Legacy v0: bands is array of arrays [["name", "type"], ...] with separate "nodata" array
+// v0.1.0+ / v0.5.0: bands is array of objects [{"name": ..., "type": ..., ...}, ...]
 inline void parse_bands_full(const std::string &json,
                              std::vector<std::pair<std::string, std::string>> &bands,
                              std::vector<BandInfo> &band_info) {
@@ -589,6 +777,21 @@ inline void parse_bands_full(const std::string &json,
                     info.nodata = parse_nodata_value(nodata_str);
                     info.has_nodata = true;
                 }
+                info.colorinterp = extract_json_string(band_obj, "colorinterp");
+                info.description = extract_json_string(band_obj, "description");
+                info.unit = extract_json_string(band_obj, "unit");
+
+                // Color table — present in both v0.1.0 (raquet 0.2.5) and v0.5.0 outputs.
+                info.colortable = parse_colortable(band_obj);
+                info.has_colortable = !info.colortable.empty();
+
+                // Stats — try v0.1.0 nested object first, fall back to v0.5.0 flat keys.
+                BandInfo::Stats s = parse_stats_v0(band_obj);
+                if (!s.has_stats) {
+                    s = parse_stats_v05(band_obj);
+                }
+                info.stats = s;
+
                 band_info.push_back(info);
             }
 
@@ -648,6 +851,10 @@ inline RaquetMetadata parse_metadata(const std::string &json) {
         meta.num_blocks = extract_json_int(json, "num_blocks", 0);
         meta.scheme = "quadbin";
     }
+
+    // Top-level source raster dimensions (present in v0.1.0 and v0.5.0+ outputs).
+    meta.width = extract_json_int(json, "width", 0);
+    meta.height = extract_json_int(json, "height", 0);
 
     parse_bands_full(json, meta.bands, meta.band_info);
 

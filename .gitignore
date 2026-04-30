@@ -1,6 +1,7 @@
 # Build directories
 build/
 cmake-build-*/
+.cache/
 
 # IDE
 .idea/
@@ -23,3 +24,5 @@ Thumbs.db
 # Test artifacts
 *.log
 duckdb_unittest_tempdir/
+# GDAL stats sidecars written next to test rasters
+*.aux.xml
