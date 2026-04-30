@@ -3,6 +3,7 @@
 #include "read_raster.hpp"
 #include "band_encoder.hpp"
 #include "band_decoder.hpp"
+#include "band_stats_v01.hpp"
 #include "raquet_metadata.hpp"
 #include "quadbin.hpp"
 #include "proj_embed.hpp"
@@ -785,31 +786,60 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         }
         bind_data->band_colortables.push_back(std::move(entries));
 
-        // Stats — GDAL approx (overview-based, fast). Derive sum / sum_squares
-        // arithmetically from mean/stddev/count so the v0.1.0 shape stays
-        // populated for downstream color-ramp consumers. Source for count is
-        // STATISTICS_VALID_PERCENT × total_pixels (matches Python's behavior).
+        // Stats. Two paths, gated on output_format:
+        //
+        //   format='v0'       — sample 1000 random pixels and compute the
+        //                       v0.1.0 stats shape used by raster-loader
+        //                       (count = sample size, plus quantiles/
+        //                       top_values/version extensions for Builder).
+        //
+        //   format='v0.5.0'   — GDAL approx stats (overview-based, fast).
+        //                       count derived from STATISTICS_VALID_PERCENT
+        //                       × total pixels per the v0.5.0 shape.
         raquet::BandInfo::Stats st;
-        double smin = 0, smax = 0, smean = 0, sstddev = 0;
-        CPLErr err = GDALComputeRasterStatistics(
-            band, bind_data->approx_stats ? TRUE : FALSE,
-            &smin, &smax, &smean, &sstddev, nullptr, nullptr);
-        if (err == CE_None) {
-            const char *vp = GDALGetMetadataItem(band, "STATISTICS_VALID_PERCENT", nullptr);
-            double valid_pct = vp ? std::stod(vp) : 100.0;
-            int64_t total = static_cast<int64_t>(bind_data->raster_width) *
-                            static_cast<int64_t>(bind_data->raster_height);
-            int64_t count = static_cast<int64_t>(std::floor(valid_pct / 100.0 * total));
-            st.count         = count;
-            st.min           = smin;
-            st.max           = smax;
-            st.mean          = smean;
-            st.stddev        = sstddev;
-            st.sum           = smean * static_cast<double>(count);
-            st.sum_squares   = (sstddev * sstddev + smean * smean) * static_cast<double>(count);
-            st.valid_percent = valid_pct;
-            st.approximated  = bind_data->approx_stats;
-            st.has_stats     = true;
+        if (bind_data->output_format == "v0") {
+            auto v01 = raquet::compute_v01_band_stats(
+                band,
+                bind_data->raster_width, bind_data->raster_height,
+                has_nd ? nd : 0.0, has_nd != 0,
+                bind_data->gdal_dtype);
+            if (v01.has_stats) {
+                st.count         = v01.count;
+                st.min           = v01.min;
+                st.max           = v01.max;
+                st.mean          = v01.mean;
+                st.stddev        = v01.stddev;
+                st.sum           = v01.sum;
+                st.sum_squares   = v01.sum_squares;
+                st.valid_percent = v01.valid_percent;
+                st.approximated  = v01.approximated;
+                st.has_stats     = true;
+                st.version       = std::move(v01.version);
+                st.quantiles     = std::move(v01.quantiles);
+                st.top_values    = std::move(v01.top_values);
+            }
+        } else {
+            double smin = 0, smax = 0, smean = 0, sstddev = 0;
+            CPLErr err = GDALComputeRasterStatistics(
+                band, bind_data->approx_stats ? TRUE : FALSE,
+                &smin, &smax, &smean, &sstddev, nullptr, nullptr);
+            if (err == CE_None) {
+                const char *vp = GDALGetMetadataItem(band, "STATISTICS_VALID_PERCENT", nullptr);
+                double valid_pct = vp ? std::stod(vp) : 100.0;
+                int64_t total = static_cast<int64_t>(bind_data->raster_width) *
+                                static_cast<int64_t>(bind_data->raster_height);
+                int64_t count = static_cast<int64_t>(std::floor(valid_pct / 100.0 * total));
+                st.count         = count;
+                st.min           = smin;
+                st.max           = smax;
+                st.mean          = smean;
+                st.stddev        = sstddev;
+                st.sum           = smean * static_cast<double>(count);
+                st.sum_squares   = (sstddev * sstddev + smean * smean) * static_cast<double>(count);
+                st.valid_percent = valid_pct;
+                st.approximated  = bind_data->approx_stats;
+                st.has_stats     = true;
+            }
         }
         bind_data->band_stats.push_back(st);
     }
