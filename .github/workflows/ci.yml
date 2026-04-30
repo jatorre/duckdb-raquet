@@ -108,11 +108,17 @@ jobs:
           FROM read_parquet('test_data/naip_test.parquet')
           WHERE block = 0;
 
-          -- Test QUADBIN functions
+          -- Test QUADBIN functions. DuckDB 1.5.2's parser rejects
+          -- (struct_returning_func()).*; use explicit field accessors
+          -- against the STRUCT(min_lon, min_lat, max_lon, max_lat) returned
+          -- by quadbin_to_bbox.
           SELECT
             block,
             quadbin_resolution(block) as zoom,
-            (quadbin_to_bbox(block)).*
+            (quadbin_to_bbox(block)).min_lon as min_lon,
+            (quadbin_to_bbox(block)).min_lat as min_lat,
+            (quadbin_to_bbox(block)).max_lon as max_lon,
+            (quadbin_to_bbox(block)).max_lat as max_lat
           FROM read_parquet('test_data/naip_test.parquet')
           WHERE block != 0
           LIMIT 3;
