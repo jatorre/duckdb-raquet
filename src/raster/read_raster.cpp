@@ -1314,8 +1314,14 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             }
 
             if (!used_cog) {
-                // Warp from source at lower resolution
-                WarpIntoTile(state.overview_src_ds, tile_ds, GRA_Average,
+                // Warp from source at lower resolution. Honour the user's
+                // resampling= named param (default GRA_NearestNeighbour) so
+                // Phase 2 fallback is consistent with Phase 1. Hardcoding
+                // GRA_Average here was wrong for categorical/palette bands —
+                // averaging neighbouring class IDs invents values that don't
+                // exist in the source (e.g. avg(10,20)=15 for a discrete
+                // class raster).
+                WarpIntoTile(state.overview_src_ds, tile_ds, state.source_resampling,
                              state.nodata_value, state.has_nodata);
             }
 
