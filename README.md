@@ -240,6 +240,8 @@ SELECT * FROM read_raster(file, [named parameters...])
 | `quality` | `INTEGER` | `85` | Compression quality for JPEG/WebP (1-100) |
 | `statistics` | `BOOLEAN` | `false` | Compute per-tile statistics (count, min, max, sum, mean, stddev) |
 | `zoom_strategy` | `VARCHAR` | `'auto'` | Zoom selection: `auto` (round), `lower` (floor, coarser), `upper` (ceil, finer) |
+| `format` | `VARCHAR` | `'v0.5.0'` | Metadata format: `'v0.5.0'` (spec) or `'v0'` (legacy v0.1.0 shape consumed by raquet 0.2.5 / CARTO platform) |
+| `approx` | `BOOLEAN` | `true` | Use GDAL's `approxOK=TRUE` overview-based statistics (fast). Set `false` for exact full-resolution stats |
 
 **Output columns:** `block` (UBIGINT), `metadata` (VARCHAR), `band_1` ... `band_N` (BLOB).
 When `statistics=true`, adds `band_N_count`, `band_N_min`, `band_N_max`, `band_N_sum`, `band_N_mean`, `band_N_stddev` columns.
@@ -485,10 +487,15 @@ A Raquet file is a Parquet file with specific conventions:
 ```json
 {
   "file_format": "raquet",
+  "version": "0.5.0",
   "compression": "gzip",
   "compression_quality": 85,
   "band_layout": "interleaved",
   "crs": "EPSG:3857",
+  "bounds": [-180, -85.05, 180, 85.05],
+  "bounds_crs": "EPSG:4326",
+  "width": 64293,
+  "height": 86760,
   "tiling": {
     "block_width": 256,
     "block_height": 256,
@@ -497,9 +504,14 @@ A Raquet file is a Parquet file with specific conventions:
     "scheme": "quadbin"
   },
   "bands": [
-    {"name": "red", "type": "uint8"},
+    {"name": "red", "type": "uint8",
+     "STATISTICS_MINIMUM": 0, "STATISTICS_MAXIMUM": 255,
+     "STATISTICS_MEAN": 127.5, "STATISTICS_STDDEV": 50.0,
+     "STATISTICS_VALID_PERCENT": 100.0},
     {"name": "green", "type": "uint8"},
-    {"name": "blue", "type": "uint8", "nodata": 0}
+    {"name": "blue", "type": "uint8", "nodata": 0,
+     "colorinterp": "blue",
+     "colortable": {"0": [0,0,0,0], "1": [0,0,255,255]}}
   ]
 }
 ```

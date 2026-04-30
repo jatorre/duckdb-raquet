@@ -103,6 +103,10 @@ struct ReadRasterBindData : public TableFunctionData {
     std::string raquet_dtype;
     int dtype_bytes = 1;
 
+    // Source raster dimensions in source pixel space (top-level width/height).
+    int raster_width = 0;
+    int raster_height = 0;
+
     // Per-band metadata
     std::vector<double> band_nodatas;
     std::vector<bool> band_has_nodata;
@@ -113,9 +117,14 @@ struct ReadRasterBindData : public TableFunctionData {
     std::vector<double> band_offsets;
     std::vector<bool> band_has_scale;
     std::vector<bool> band_has_offset;
+    // Per-band palette + GDAL-derived stats — empty entries when unavailable.
+    std::vector<std::vector<std::array<int, 4>>> band_colortables;
+    std::vector<raquet::BandInfo::Stats> band_stats;
 
     // Tile statistics
     bool statistics = false;
+    // Use approxOK=TRUE for GDAL stats (faster — overview-based when available).
+    bool approx_stats = true;
 
     // Spatial info
     double bounds_minlon = 0, bounds_minlat = 0, bounds_maxlon = 0, bounds_maxlat = 0;
@@ -764,6 +773,8 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
             if (bind_data->output_format != "v0" && bind_data->output_format != "v0.5.0") {
                 throw InvalidInputException("format must be 'v0' or 'v0.5.0'");
             }
+        } else if (kv.first == "approx") {
+            bind_data->approx_stats = kv.second.GetValue<bool>();
         }
     }
 
@@ -786,6 +797,8 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
 
     // Read raster properties
     bind_data->raster_band_count = GDALGetRasterCount(ds);
+    bind_data->raster_width = GDALGetRasterXSize(ds);
+    bind_data->raster_height = GDALGetRasterYSize(ds);
     if (bind_data->raster_band_count == 0) {
         GDALClose(ds);
         throw InvalidInputException("Raster file has no bands: %s", bind_data->filename);
@@ -823,6 +836,50 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         double offset = GDALGetRasterOffset(band, &has_offset);
         bind_data->band_offsets.push_back(offset);
         bind_data->band_has_offset.push_back(has_offset != 0 && offset != 0.0);
+
+        // Color table — only meaningful for palette bands (renderers need RGBA per index).
+        std::vector<std::array<int, 4>> entries;
+        if (ci == GCI_PaletteIndex) {
+            GDALColorTableH ct = GDALGetRasterColorTable(band);
+            if (ct) {
+                int n = GDALGetColorEntryCount(ct);
+                entries.reserve(n);
+                for (int i = 0; i < n; i++) {
+                    const GDALColorEntry *e = GDALGetColorEntry(ct, i);
+                    if (!e) continue;
+                    entries.push_back({e->c1, e->c2, e->c3, e->c4});
+                }
+            }
+        }
+        bind_data->band_colortables.push_back(std::move(entries));
+
+        // Stats — GDAL approx (overview-based, fast). Derive sum / sum_squares
+        // arithmetically from mean/stddev/count so the v0.1.0 shape stays
+        // populated for downstream color-ramp consumers. Source for count is
+        // STATISTICS_VALID_PERCENT × total_pixels (matches Python's behavior).
+        raquet::BandInfo::Stats st;
+        double smin = 0, smax = 0, smean = 0, sstddev = 0;
+        CPLErr err = GDALComputeRasterStatistics(
+            band, bind_data->approx_stats ? TRUE : FALSE,
+            &smin, &smax, &smean, &sstddev, nullptr, nullptr);
+        if (err == CE_None) {
+            const char *vp = GDALGetMetadataItem(band, "STATISTICS_VALID_PERCENT", nullptr);
+            double valid_pct = vp ? std::stod(vp) : 100.0;
+            int64_t total = static_cast<int64_t>(bind_data->raster_width) *
+                            static_cast<int64_t>(bind_data->raster_height);
+            int64_t count = static_cast<int64_t>(std::floor(valid_pct / 100.0 * total));
+            st.count         = count;
+            st.min           = smin;
+            st.max           = smax;
+            st.mean          = smean;
+            st.stddev        = sstddev;
+            st.sum           = smean * static_cast<double>(count);
+            st.sum_squares   = (sstddev * sstddev + smean * smean) * static_cast<double>(count);
+            st.valid_percent = valid_pct;
+            st.approximated  = bind_data->approx_stats;
+            st.has_stats     = true;
+        }
+        bind_data->band_stats.push_back(st);
     }
 
     // CF time dimension extraction (NetCDF)
@@ -1438,6 +1495,8 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         meta.bounds_minlat = bind_data.bounds_minlat;
         meta.bounds_maxlon = bind_data.bounds_maxlon;
         meta.bounds_maxlat = bind_data.bounds_maxlat;
+        meta.width = bind_data.raster_width;
+        meta.height = bind_data.raster_height;
 
         // Tile statistics metadata
         if (bind_data.statistics) {
@@ -1477,6 +1536,13 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             if (b < static_cast<int>(bind_data.band_has_offset.size()) && bind_data.band_has_offset[b]) {
                 bi.offset = bind_data.band_offsets[b];
                 bi.has_offset = true;
+            }
+            if (b < static_cast<int>(bind_data.band_colortables.size())) {
+                bi.colortable = bind_data.band_colortables[b];
+                bi.has_colortable = !bi.colortable.empty();
+            }
+            if (b < static_cast<int>(bind_data.band_stats.size())) {
+                bi.stats = bind_data.band_stats[b];
             }
             meta.band_info.push_back(bi);
             meta.bands.push_back({bi.name, bi.type});
@@ -1543,6 +1609,7 @@ void RegisterReadRaster(ExtensionLoader &loader) {
     func.named_parameters["statistics"] = LogicalType::BOOLEAN;
     func.named_parameters["zoom_strategy"] = LogicalType::VARCHAR;
     func.named_parameters["format"] = LogicalType::VARCHAR;
+    func.named_parameters["approx"] = LogicalType::BOOLEAN;
     func.cardinality = ReadRasterCardinality;
 
     loader.RegisterFunction(func);
