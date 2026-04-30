@@ -25,7 +25,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -236,6 +238,16 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
     // processed (emitted or skipped-empty). Used by the Phase 2 init winner
     // to wait for in-flight workers before any thread reads total_blocks.
     std::atomic<idx_t> phase1_finished{0};
+
+    // Cross-phase wakeup. One mutex/cv pair handles all three transition
+    // points (phase1-stragglers done, phase2-init published, phase2 staging
+    // published). Waiters use predicates that read the relevant atomic;
+    // notifiers do an empty lock_guard + notify_all whenever an atomic that
+    // any predicate watches flips. Spurious wakeups are absorbed by the
+    // predicate; the empty-locked notify guarantees no waiter misses a
+    // wakeup while between predicate check and wait().
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
 
     // Whether we need overviews at all
     bool has_overviews = false;
@@ -1266,8 +1278,14 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         GDALClose(tile_ds);
         VSIUnlink(tile_path.c_str());
 
-        // Mark this tile as fully processed (emitted or skipped-empty)
-        state.phase1_finished.fetch_add(1, std::memory_order_release);
+        // Mark this tile as fully processed (emitted or skipped-empty). When
+        // we are the thread that lands the final increment, wake any Phase 2
+        // init-winner that is waiting for stragglers.
+        idx_t prev_finished = state.phase1_finished.fetch_add(1, std::memory_order_acq_rel);
+        if (prev_finished + 1 == state.native_tiles.size()) {
+            { std::lock_guard<std::mutex> lk(state.wait_mutex); }
+            state.wait_cv.notify_all();
+        }
     }
 
     // If we emitted rows from native tiles, return them
@@ -1292,8 +1310,15 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         if (!state.phase2_init_done.load(std::memory_order_acquire)) {
             bool expected = false;
             if (state.phase2_init_claimed.compare_exchange_strong(expected, true)) {
-                while (state.phase1_finished.load(std::memory_order_acquire) < state.native_tiles.size()) {
-                    std::this_thread::yield();
+                // Wait for in-flight Phase 1 workers via condvar instead of
+                // burning CPU in a yield-loop. The final Phase 1 finisher
+                // notifies wait_cv after its fetch_add lands the total.
+                {
+                    std::unique_lock<std::mutex> lk(state.wait_mutex);
+                    state.wait_cv.wait(lk, [&] {
+                        return state.phase1_finished.load(std::memory_order_acquire)
+                               >= state.native_tiles.size();
+                    });
                 }
                 if (state.overview_frames.empty()) {
                     // Nothing to stage; skip straight to metadata.
@@ -1302,10 +1327,16 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                     state.overview_results.reserve(state.overview_frames.size());
                 }
                 state.phase2_init_done.store(true, std::memory_order_release);
+                // Wake siblings waiting on phase2_init_done, plus any thread
+                // already past staging that's parked on phase2_staged (the
+                // empty-frames short-circuit above flips it).
+                { std::lock_guard<std::mutex> lk(state.wait_mutex); }
+                state.wait_cv.notify_all();
             } else {
-                while (!state.phase2_init_done.load(std::memory_order_acquire)) {
-                    std::this_thread::yield();
-                }
+                std::unique_lock<std::mutex> lk(state.wait_mutex);
+                state.wait_cv.wait(lk, [&] {
+                    return state.phase2_init_done.load(std::memory_order_acquire);
+                });
             }
         }
 
@@ -1384,20 +1415,33 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
 
             idx_t completed = state.overview_frames_processed.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (completed >= total_frames) {
-                // We finished the last overview tile — publish the staged queue.
+                // We finished the last overview tile — publish the staged
+                // queue and wake any post-staging waiter parked on wait_cv.
                 state.phase2_staged.store(true, std::memory_order_release);
+                { std::lock_guard<std::mutex> lk(state.wait_mutex); }
+                state.wait_cv.notify_all();
             }
         }
 
         // After the work-pull loop: phase2_staged is either set already (we
         // were the last finisher, or another thread was) or still pending
-        // because some sibling is still warping its current tile. In the
-        // latter case yield and let DuckDB call us back; we'll fall through
-        // to the drain on the next entry.
+        // because some sibling is still warping its current tile. Park on
+        // wait_cv with a short timeout — sleeping rather than burning CPU
+        // bouncing through SetCardinality(0)/Execute. The timeout is a
+        // safety valve so a missed notify doesn't deadlock the pipeline; on
+        // wake we still hand control back to DuckDB if staging hasn't
+        // published yet.
         if (!state.phase2_staged.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-            output.SetCardinality(0);
-            return;
+            {
+                std::unique_lock<std::mutex> lk(state.wait_mutex);
+                state.wait_cv.wait_for(lk, std::chrono::milliseconds(50), [&] {
+                    return state.phase2_staged.load(std::memory_order_acquire);
+                });
+            }
+            if (!state.phase2_staged.load(std::memory_order_acquire)) {
+                output.SetCardinality(0);
+                return;
+            }
         }
         // Fall through to drain.
     }
