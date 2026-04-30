@@ -248,6 +248,34 @@ Tier 1 (#1 + #2) lands in this branch / a follow-up; Tier 2 (#3) lands in a dedi
 
 ---
 
+## Measured impact of Tier 1 (this branch's `perf/tier1-tier2`)
+
+Both Tier 1 items have landed and been validated against the same Docker / hardware / source as the headline numbers above.
+
+| Variant | Wall | CPU% | Output | Status |
+|---|---|---|---|---|
+| `fix/parallel-correctness` (5029627) | 8:44 | ~1140 % | 354 MB / 53,423 tiles | clean |
+| `perf/tier1-tier2` (condvar + transformer cache) | **5:39** | ~1462 % | 370 MB / 53,423 tiles | clean |
+
+That's **-3:05 (-36 %)** and a **+28 % core-utilization** lift, beating the ~6:00-6:30 estimate above. Two reasons it came in lower than predicted:
+
+- Transformer reuse hits Phase 1 too, not just Phase 2. Phase-1-only run dropped 3:33 → 3:12 (-10 %, ~21 s of avoided PROJ-pipeline init across the 16 worker threads).
+- Removing the spin-yield contention let GDAL's per-thread warp work actually parallelize against itself instead of fighting the scheduler. CPU saturation went up before any algorithmic change to the warp itself.
+
+Per-commit attribution on Berlin (small enough to expose constants instead of asymptotic costs):
+
+| Variant | Berlin parallel pyramid wall |
+|---|---|
+| `fix/parallel-correctness` | 4.47 s |
+| + condvar wait | 2.45 s |
+| + transformer cache | **0.70 s** |
+
+The Berlin run had 232 tiles × ~10 ms transformer init = ~2.3 s of init work that the cache eliminated outright. On Germany the same constant becomes ~30-40 s after fan-out, lining up with the measured 53k-tile saving once Phase 2 levels are factored in.
+
+Tier 2 (pre-filter empty bbox tiles) is the still-open lever — expected another 15-25 % on Phase 1 for sparse shapes like Germany.
+
+---
+
 ## Build environment
 
 The whole build is containerized to avoid touching the host system, while still producing a binary that closely matches the production-deployed extension. The setup lives in a sibling directory at `~/dev_projs/cartolibs/duckdb-raquet-build/`, which contains:
