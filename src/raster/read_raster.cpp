@@ -257,7 +257,19 @@ struct ReadRasterLocalState : public LocalTableFunctionState {
     char *web_mercator_wkt = nullptr;
     bool initialized = false;
 
+    // Cached warp transformer. Source dataset and source/dest CRS are
+    // constant for the whole query; only the destination geotransform
+    // varies per tile. Reuse the transformer across tiles by updating just
+    // the dst geotransform via GDALSetGenImgProjTransformerDstGeoTransform;
+    // rebuild from scratch when the source overview level changes
+    // (Phase 1 → Phase 2 fallback, or between Phase 2 zoom levels). Saves
+    // the 5-15 ms PROJ-pipeline init that GDALCreateGenImgProjTransformer2
+    // performs on every call.
+    void *warp_transformer = nullptr;
+    int warp_transformer_overview_level = -2;  // sentinel: uninitialized
+
     ~ReadRasterLocalState() {
+        if (warp_transformer) GDALDestroyGenImgProjTransformer(warp_transformer);
         if (web_mercator_wkt) CPLFree(web_mercator_wkt);
         if (src_ds) GDALClose(src_ds);
     }
@@ -327,17 +339,54 @@ static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *wkt_3857,
 
 // ─────────────────────────────────────────────
 // Helper: Warp source dataset into tile dataset
+//
+// Uses local.warp_transformer as a per-thread cache so the PROJ pipeline
+// init (5-15 ms) doesn't run on every tile. The transformer is rebuilt
+// only when the source overview level changes; otherwise the destination
+// geotransform is updated via GDALSetGenImgProjTransformerDstGeoTransform
+// and the warp uses the cached object.
 // ─────────────────────────────────────────────
-static void WarpIntoTile(GDALDatasetH src_ds, GDALDatasetH tile_ds,
+static void WarpIntoTile(ReadRasterLocalState &local, GDALDatasetH tile_ds,
                           GDALResampleAlg resample, double nodata, bool has_nodata,
                           int overview_level = -1) {
+    GDALDatasetH src_ds = local.src_ds;
+
+    if (!local.warp_transformer || local.warp_transformer_overview_level != overview_level) {
+        // (Re)build the transformer. OVERVIEW_LEVEL belongs on the
+        // transformer (consumed by GDALCreateGenImgProjTransformer2 as
+        // SRC_OVERVIEW_LEVEL), not on GDALWarpOptions::papszWarpOptions.
+        if (local.warp_transformer) {
+            GDALDestroyGenImgProjTransformer(local.warp_transformer);
+            local.warp_transformer = nullptr;
+        }
+        char **transformer_options = nullptr;
+        if (overview_level >= 0) {
+            char ovr_str[32];
+            snprintf(ovr_str, sizeof(ovr_str), "%d", overview_level);
+            transformer_options = CSLSetNameValue(transformer_options, "SRC_OVERVIEW_LEVEL", ovr_str);
+        }
+        local.warp_transformer = GDALCreateGenImgProjTransformer2(src_ds, tile_ds, transformer_options);
+        CSLDestroy(transformer_options);
+        if (!local.warp_transformer) {
+            throw IOException("Failed to create image projection transformer");
+        }
+        local.warp_transformer_overview_level = overview_level;
+    } else {
+        // Same overview level — reuse the cached transformer, just point
+        // it at the new tile's geotransform. Source CRS and source
+        // geotransform haven't changed; destination CRS hasn't changed
+        // either (every tile_ds is in EPSG:3857 with identical WKT).
+        double dst_gt[6];
+        GDALGetGeoTransform(tile_ds, dst_gt);
+        GDALSetGenImgProjTransformerDstGeoTransform(local.warp_transformer, dst_gt);
+    }
+
     GDALWarpOptions *wo = GDALCreateWarpOptions();
     wo->hSrcDS = src_ds;
     wo->hDstDS = tile_ds;
     wo->eResampleAlg = resample;
     wo->nBandCount = GDALGetRasterCount(src_ds);
 
-    // Set up band mapping
     wo->panSrcBands = static_cast<int *>(CPLMalloc(sizeof(int) * wo->nBandCount));
     wo->panDstBands = static_cast<int *>(CPLMalloc(sizeof(int) * wo->nBandCount));
     for (int i = 0; i < wo->nBandCount; i++) {
@@ -354,29 +403,15 @@ static void WarpIntoTile(GDALDatasetH src_ds, GDALDatasetH tile_ds,
         }
     }
 
-    // Build transformer options. OVERVIEW_LEVEL belongs on the transformer
-    // (consumed by GDALCreateGenImgProjTransformer2 as SRC_OVERVIEW_LEVEL),
-    // not on GDALWarpOptions::papszWarpOptions.
-    char **transformer_options = nullptr;
-    if (overview_level >= 0) {
-        char ovr_str[32];
-        snprintf(ovr_str, sizeof(ovr_str), "%d", overview_level);
-        transformer_options = CSLSetNameValue(transformer_options, "SRC_OVERVIEW_LEVEL", ovr_str);
-    }
-
-    // Create coordinate transformation (v2 form so SRC_OVERVIEW_LEVEL is honored)
-    wo->pTransformerArg = GDALCreateGenImgProjTransformer2(src_ds, tile_ds, transformer_options);
-    CSLDestroy(transformer_options);
-    if (!wo->pTransformerArg) {
-        GDALDestroyWarpOptions(wo);
-        throw IOException("Failed to create image projection transformer");
-    }
+    // Borrow the cached transformer; ownership stays with local state, so
+    // detach pTransformerArg before GDALDestroyWarpOptions runs.
+    wo->pTransformerArg = local.warp_transformer;
     wo->pfnTransformer = GDALGenImgProjTransform;
 
     GDALWarpOperation warp_op;
     CPLErr err = warp_op.Initialize(wo);
     if (err != CE_None) {
-        GDALDestroyGenImgProjTransformer(wo->pTransformerArg);
+        wo->pTransformerArg = nullptr;
         GDALDestroyWarpOptions(wo);
         throw IOException("Warp initialization failed");
     }
@@ -385,7 +420,6 @@ static void WarpIntoTile(GDALDatasetH src_ds, GDALDatasetH tile_ds,
                                      GDALGetRasterXSize(tile_ds),
                                      GDALGetRasterYSize(tile_ds));
 
-    GDALDestroyGenImgProjTransformer(wo->pTransformerArg);
     wo->pTransformerArg = nullptr;
     GDALDestroyWarpOptions(wo);
 
@@ -1171,7 +1205,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             bind_data.raster_band_count, bind_data.gdal_dtype,
             state.nodata_value, state.has_nodata, tile_path);
 
-        WarpIntoTile(local.src_ds, tile_ds, state.source_resampling,
+        WarpIntoTile(local, tile_ds, state.source_resampling,
                      state.nodata_value, state.has_nodata);
 
         bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
@@ -1292,7 +1326,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                         int ovr_xsize = GDALGetRasterBandXSize(ovr);
                         double ovr_reduction = static_cast<double>(src_xsize) / ovr_xsize;
                         if (std::abs(ovr_reduction - reduction_factor) / reduction_factor < 0.1) {
-                            WarpIntoTile(local.src_ds, tile_ds, GRA_NearestNeighbour,
+                            WarpIntoTile(local, tile_ds, GRA_NearestNeighbour,
                                          state.nodata_value, state.has_nodata, i);
                             used_cog = true;
                             break;
@@ -1303,7 +1337,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
 
             if (!used_cog) {
                 // Fallback: warp from base resolution
-                WarpIntoTile(local.src_ds, tile_ds, GRA_Average,
+                WarpIntoTile(local, tile_ds, GRA_Average,
                              state.nodata_value, state.has_nodata);
             }
 
