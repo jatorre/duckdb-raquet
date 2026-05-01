@@ -181,10 +181,31 @@ statement ok
 DROP TABLE r_v0
 
 # =============================================================================
-# format='v0' uses sample-based stats unconditionally — approx=false still
-# yields approximated_stats=true here. (For v0.5.0 below, approx=false routes
-# through GDAL's exact stats path and flips the flag.)
+# approx=false now flips approximated_stats=false in BOTH formats — basic stats
+# from GDAL's full-resolution path, quantiles/top_values from a streaming
+# full-band histogram instead of a 1000-pixel sample.
 # =============================================================================
+
+statement ok
+CREATE TABLE r_v0_exact AS
+SELECT metadata FROM read_raster('test/data/test_palette.tif', format='v0', approx=false)
+WHERE block = 0
+
+query I
+SELECT json_extract(metadata, '$.bands[0].stats.approximated_stats')::BOOLEAN
+FROM r_v0_exact
+----
+false
+
+# Histogram-based quantiles still populated.
+query I
+SELECT json_array_length(json_keys(json_extract(metadata, '$.bands[0].stats.quantiles')))
+FROM r_v0_exact
+----
+17
+
+statement ok
+DROP TABLE r_v0_exact
 
 statement ok
 CREATE TABLE r_v050_exact AS
@@ -194,6 +215,21 @@ WHERE block = 0
 query I
 SELECT json_extract(metadata, '$.bands[0].STATISTICS_VALID_PERCENT')::DOUBLE
        BETWEEN 0 AND 100
+FROM r_v050_exact
+----
+true
+
+# v0.5.0 now also emits quantiles/top_values as raster-loader-shape extensions
+# alongside the spec-required STATISTICS_* keys.
+query I
+SELECT json_array_length(json_keys(json_extract(metadata, '$.bands[0].quantiles')))
+FROM r_v050_exact
+----
+17
+
+query I
+SELECT json_array_length(json_keys(json_extract(metadata, '$.bands[0].top_values')))
+       BETWEEN 1 AND 10
 FROM r_v050_exact
 ----
 true

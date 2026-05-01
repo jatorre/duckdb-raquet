@@ -275,15 +275,11 @@ struct RaquetMetadata {
         out += ",\"stddev\":" + std::to_string(s.stddev);
         out += ",\"sum\":" + std::to_string(s.sum);
         out += ",\"sum_squares\":" + std::to_string(s.sum_squares);
-        if (!s.quantiles.empty()) {
-            out += ",\"quantiles\":" + quantiles_to_json(s.quantiles);
-        }
-        if (!s.top_values.empty()) {
-            out += ",\"top_values\":" + top_values_to_json(s.top_values);
-        }
-        if (!s.version.empty()) {
-            out += ",\"version\":\"" + s.version + "\"";
-        }
+        // Always emit quantiles, top_values, and version (as {}/{}/"" when
+        // unpopulated) so downstream consumers see a stable schema.
+        out += ",\"quantiles\":" + quantiles_to_json(s.quantiles);
+        out += ",\"top_values\":" + top_values_to_json(s.top_values);
+        out += ",\"version\":\"" + s.version + "\"";
         out += ",\"approximated_stats\":";
         out += s.approximated ? "true" : "false";
         out += "}";
@@ -464,6 +460,11 @@ struct RaquetMetadata {
                 json += ",\"STATISTICS_MEAN\":" + std::to_string(s.mean);
                 json += ",\"STATISTICS_STDDEV\":" + std::to_string(s.stddev);
                 json += ",\"STATISTICS_VALID_PERCENT\":" + std::to_string(s.valid_percent);
+                // raster-loader-shape extensions (also emitted in v0.1.0).
+                // Not in the v0.5.0 spec, but used by CARTO Builder colormap
+                // UIs. Always emit so the schema is stable across formats.
+                json += ",\"quantiles\":" + quantiles_to_json(s.quantiles);
+                json += ",\"top_values\":" + top_values_to_json(s.top_values);
             }
             json += "}";
         }

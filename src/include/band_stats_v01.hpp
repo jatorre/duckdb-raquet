@@ -12,15 +12,22 @@
 namespace duckdb {
 namespace raquet {
 
-// Sample-based per-band stats matching the v0.1.0 metadata shape
-// emitted by Python raster-loader (raster_loader/io/common.py).
+// Per-band statistics shared by both v0.1.0 and v0.5.0 metadata output.
 //
-// Reads up to 1000 pixels at random positions within the band's pixel
-// extent; excludes nodata, NaN, and infinite values; computes
-// accumulators, quantiles for N in 3..19, and top-10 most-common
-// values. The producer tag is hardcoded to a "duckdb-raquet-..." string
-// so downstream consumers can distinguish this output from
-// raster-loader's.
+// The seven numeric fields (count, min, max, mean, stddev, sum,
+// sum_squares) come from `GDALComputeRasterStatistics` with `approxOK`
+// toggled by the caller's `approx` flag, plus arithmetic identities
+// (count = STATISTICS_VALID_PERCENT × width × height, sum = mean×count,
+// sum_squares = count × (stddev² + mean²)). The two extension fields
+// (quantiles, top_values) are raster-loader-shape extensions used by
+// CARTO Builder colormap UIs; they're emitted in both v0.1.0 and
+// v0.5.0 output even though the raquet spec defines neither.
+//
+// In `approx` mode, quantiles/top_values come from a 1000-pixel
+// random sample. In exact mode, they're derived from a streaming
+// histogram of the full band — exact for fixed-bucket integer dtypes
+// (uint8/int8/uint16/int16), and exact-up-to-bin-width for wider
+// integer / float dtypes.
 struct V01BandStatsResult {
     int64_t count = 0;
     double  min = 0.0;
@@ -33,15 +40,22 @@ struct V01BandStatsResult {
     bool    approximated = true;
     bool    has_stats = false;
     std::string version;                              // producer tag
-    std::map<int, std::vector<double>> quantiles;     // keys 3..19
-    std::map<double, int64_t> top_values;             // up to 10 entries
+    std::map<int, std::vector<double>> quantiles;     // keys 3..19; empty if uncomputable
+    std::map<double, int64_t> top_values;             // up to 10 entries; empty if uncomputable
 };
 
+// Compute per-band stats. When `approx == true` (default), this is
+// fast: GDAL overview-based stats for the seven numeric fields, plus a
+// 1000-pixel random sample for quantiles/top_values. When `approx ==
+// false`, GDAL does a full-resolution scan AND we run a streaming
+// pass over the band to build a histogram for exact quantiles /
+// top_values.
 V01BandStatsResult compute_v01_band_stats(
     GDALRasterBandH band,
     int raster_width, int raster_height,
     double nodata, bool has_nodata,
-    GDALDataType dtype);
+    GDALDataType dtype,
+    bool approx);
 
 }  // namespace raquet
 }  // namespace duckdb

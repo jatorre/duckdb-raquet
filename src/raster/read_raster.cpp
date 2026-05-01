@@ -854,60 +854,34 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         }
         bind_data->band_colortables.push_back(std::move(entries));
 
-        // Stats. Two paths, gated on output_format:
-        //
-        //   format='v0'       — sample 1000 random pixels and compute the
-        //                       v0.1.0 stats shape used by raster-loader
-        //                       (count = sample size, plus quantiles/
-        //                       top_values/version extensions for Builder).
-        //
-        //   format='v0.5.0'   — GDAL approx stats (overview-based, fast).
-        //                       count derived from STATISTICS_VALID_PERCENT
-        //                       × total pixels per the v0.5.0 shape.
+        // Per-band stats. Single helper drives both v0.1.0 and v0.5.0
+        // output: GDAL's approxOK toggle controls the basic 7 fields
+        // (count/min/max/mean/stddev/sum/sum_squares) for both formats,
+        // and quantiles/top_values come from a 1000-pixel sample (approx)
+        // or a streaming full-band histogram (exact). Empty extension
+        // dicts when the band is too sparse — emitted as `{}` by the
+        // serializer.
         raquet::BandInfo::Stats st;
-        if (bind_data->output_format == "v0") {
-            auto v01 = raquet::compute_v01_band_stats(
-                band,
-                bind_data->raster_width, bind_data->raster_height,
-                has_nd ? nd : 0.0, has_nd != 0,
-                bind_data->gdal_dtype);
-            if (v01.has_stats) {
-                st.count         = v01.count;
-                st.min           = v01.min;
-                st.max           = v01.max;
-                st.mean          = v01.mean;
-                st.stddev        = v01.stddev;
-                st.sum           = v01.sum;
-                st.sum_squares   = v01.sum_squares;
-                st.valid_percent = v01.valid_percent;
-                st.approximated  = v01.approximated;
-                st.has_stats     = true;
-                st.version       = std::move(v01.version);
-                st.quantiles     = std::move(v01.quantiles);
-                st.top_values    = std::move(v01.top_values);
-            }
-        } else {
-            double smin = 0, smax = 0, smean = 0, sstddev = 0;
-            CPLErr err = GDALComputeRasterStatistics(
-                band, bind_data->approx_stats ? TRUE : FALSE,
-                &smin, &smax, &smean, &sstddev, nullptr, nullptr);
-            if (err == CE_None) {
-                const char *vp = GDALGetMetadataItem(band, "STATISTICS_VALID_PERCENT", nullptr);
-                double valid_pct = vp ? std::stod(vp) : 100.0;
-                int64_t total = static_cast<int64_t>(bind_data->raster_width) *
-                                static_cast<int64_t>(bind_data->raster_height);
-                int64_t count = static_cast<int64_t>(std::floor(valid_pct / 100.0 * total));
-                st.count         = count;
-                st.min           = smin;
-                st.max           = smax;
-                st.mean          = smean;
-                st.stddev        = sstddev;
-                st.sum           = smean * static_cast<double>(count);
-                st.sum_squares   = (sstddev * sstddev + smean * smean) * static_cast<double>(count);
-                st.valid_percent = valid_pct;
-                st.approximated  = bind_data->approx_stats;
-                st.has_stats     = true;
-            }
+        auto v01 = raquet::compute_v01_band_stats(
+            band,
+            bind_data->raster_width, bind_data->raster_height,
+            has_nd ? nd : 0.0, has_nd != 0,
+            bind_data->gdal_dtype,
+            bind_data->approx_stats);
+        if (v01.has_stats) {
+            st.count         = v01.count;
+            st.min           = v01.min;
+            st.max           = v01.max;
+            st.mean          = v01.mean;
+            st.stddev        = v01.stddev;
+            st.sum           = v01.sum;
+            st.sum_squares   = v01.sum_squares;
+            st.valid_percent = v01.valid_percent;
+            st.approximated  = v01.approximated;
+            st.has_stats     = true;
+            st.version       = std::move(v01.version);
+            st.quantiles     = std::move(v01.quantiles);
+            st.top_values    = std::move(v01.top_values);
         }
         bind_data->band_stats.push_back(st);
     }
