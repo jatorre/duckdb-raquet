@@ -441,42 +441,58 @@ static void WarpIntoTile(ReadRasterLocalState &local, GDALDatasetH tile_ds,
 // ─────────────────────────────────────────────
 // Helper: Check if a tile is entirely nodata (empty)
 // ─────────────────────────────────────────────
-static bool IsTileEmpty(GDALDatasetH ds, double nodata, bool has_nodata) {
-    if (!has_nodata) return false;
+// A tile is empty only if EVERY band is fully nodata. Short-circuits on the
+// first non-nodata pixel found in any band. Each band uses its own nodata
+// value (per-band nodata is allowed by GDAL). If any band lacks a defined
+// nodata, or the read fails, returns false (keep the tile) — we cannot
+// prove emptiness and dropping the tile would silently lose valid data.
+static bool IsTileEmpty(GDALDatasetH ds,
+                         const std::vector<double> &band_nodatas,
+                         const std::vector<bool> &band_has_nodata) {
+    int band_count = GDALGetRasterCount(ds);
+    if (band_count == 0) return false;
 
-    int width = GDALGetRasterXSize(ds);
+    if (static_cast<int>(band_has_nodata.size()) < band_count) return false;
+    for (int i = 0; i < band_count; i++) {
+        if (!band_has_nodata[i]) return false;
+    }
+
+    int width  = GDALGetRasterXSize(ds);
     int height = GDALGetRasterYSize(ds);
-    GDALRasterBandH band = GDALGetRasterBand(ds, 1);
-
-    // Read first band and check if all pixels are nodata
     size_t num_pixels = static_cast<size_t>(width) * height;
-    GDALDataType dt = GDALGetRasterDataType(band);
-    int dt_size = GDALGetDataTypeSizeBytes(dt);
 
-    std::vector<uint8_t> buf(num_pixels * dt_size);
-    CPLErr err = GDALRasterIO(band, GF_Read, 0, 0, width, height,
-                               buf.data(), width, height, dt, 0, 0);
-    if (err != CE_None) return false;
+    std::vector<uint8_t> buf;
+    for (int b = 1; b <= band_count; b++) {
+        GDALRasterBandH band = GDALGetRasterBand(ds, b);
+        GDALDataType dt = GDALGetRasterDataType(band);
+        int dt_size = GDALGetDataTypeSizeBytes(dt);
 
-    bool is_nan_nodata = std::isnan(nodata);
+        double nodata = band_nodatas[b - 1];
+        bool is_nan_nodata = std::isnan(nodata);
 
-    for (size_t i = 0; i < num_pixels; i++) {
-        double val = 0;
-        switch (dt) {
-            case GDT_Byte:    val = static_cast<double>(buf[i]); break;
-            case GDT_Int16:   { int16_t v; memcpy(&v, buf.data() + i * 2, 2); val = v; break; }
-            case GDT_UInt16:  { uint16_t v; memcpy(&v, buf.data() + i * 2, 2); val = v; break; }
-            case GDT_Int32:   { int32_t v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
-            case GDT_UInt32:  { uint32_t v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
-            case GDT_Float32: { float v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
-            case GDT_Float64: { memcpy(&val, buf.data() + i * 8, 8); break; }
-            default: return false;
-        }
+        buf.assign(num_pixels * dt_size, 0);
+        CPLErr err = GDALRasterIO(band, GF_Read, 0, 0, width, height,
+                                   buf.data(), width, height, dt, 0, 0);
+        if (err != CE_None) return false;
 
-        if (is_nan_nodata) {
-            if (!std::isnan(val)) return false;
-        } else {
-            if (val != nodata) return false;
+        for (size_t i = 0; i < num_pixels; i++) {
+            double val = 0;
+            switch (dt) {
+                case GDT_Byte:    val = static_cast<double>(buf[i]); break;
+                case GDT_Int8:    { int8_t v; memcpy(&v, buf.data() + i, 1); val = v; break; }
+                case GDT_Int16:   { int16_t v; memcpy(&v, buf.data() + i * 2, 2); val = v; break; }
+                case GDT_UInt16:  { uint16_t v; memcpy(&v, buf.data() + i * 2, 2); val = v; break; }
+                case GDT_Int32:   { int32_t v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
+                case GDT_UInt32:  { uint32_t v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
+                case GDT_Int64:   { int64_t v; memcpy(&v, buf.data() + i * 8, 8); val = static_cast<double>(v); break; }
+                case GDT_UInt64:  { uint64_t v; memcpy(&v, buf.data() + i * 8, 8); val = static_cast<double>(v); break; }
+                case GDT_Float32: { float v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
+                case GDT_Float64: { memcpy(&val, buf.data() + i * 8, 8); break; }
+                default: return false;
+            }
+
+            bool pixel_is_nodata = is_nan_nodata ? std::isnan(val) : (val == nodata);
+            if (!pixel_is_nodata) return false;
         }
     }
     return true;
@@ -1269,7 +1285,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         WarpIntoTile(local, tile_ds, state.source_resampling,
                      state.nodata_value, state.has_nodata);
 
-        bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
+        bool empty = IsTileEmpty(tile_ds, bind_data.band_nodatas, bind_data.band_has_nodata);
 
         if (!empty) {
             auto tile_data = ReadAndCompressBands(
@@ -1408,7 +1424,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                              state.nodata_value, state.has_nodata);
             }
 
-            bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
+            bool empty = IsTileEmpty(tile_ds, bind_data.band_nodatas, bind_data.band_has_nodata);
 
             if (!empty) {
                 auto tile_data = ReadAndCompressBands(
