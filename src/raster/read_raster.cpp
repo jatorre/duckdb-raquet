@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,20 @@
 #include <vector>
 
 namespace duckdb {
+
+// ─────────────────────────────────────────────
+// Debug-timing instrumentation: only emits stderr lines when the env
+// var RAQUET_DEBUG_TIMING is set (any non-empty value). Cached on first
+// read to avoid repeated getenv() calls. The atomic timestamp stores in
+// the global state run unconditionally — they're cheap and harmless.
+// ─────────────────────────────────────────────
+static bool DebugTimingEnabled() {
+    static const bool enabled = []() {
+        const char *v = std::getenv("RAQUET_DEBUG_TIMING");
+        return v != nullptr && v[0] != '\0';
+    }();
+    return enabled;
+}
 
 // ─────────────────────────────────────────────
 // GDAL type → raquet BandDataType string mapping
@@ -160,6 +175,14 @@ struct ReadRasterBindData : public TableFunctionData {
     bool sparsity_probe_active = false;     // resolved at bind time
     std::vector<bool> band_is_empty;        // valid_percent <= 0 ⇒ true
 
+    // Mask-buffer dimension for the IO probe (32×32 default). Smaller values
+    // (8, 16) read fewer mask cells per probe — faster, but with sparse
+    // rasters whose source overviews were built with -r nearest, smaller
+    // probes can produce false-positive empty (tile dropped despite
+    // having valid pixels). 32 is the empirically-validated sweet spot.
+    // Capped at block_size (no point probing finer than the destination).
+    int sparsity_probe_size = 32;
+
     // Band filter — 1-based source-band indices to emit, in output order.
     // Empty after parsing means "use all source bands"; the post-parse fill
     // populates 1..raster_band_count in that case so downstream code never
@@ -211,7 +234,41 @@ struct OverviewFrame {
 };
 
 // ─────────────────────────────────────────────
-// Global state — two-phase: parallel native zoom, then single-thread overviews
+// Execution state machine — three phases, transitions enforced via the
+// atomic flags below.
+//
+//   Phase 1 — Native-zoom tiles (parallel)
+//     Workers pull from `native_tiles` via `next_tile_idx` (mutex
+//     protected). Each tile: pre-warp checks → `WarpIntoTile` from
+//     source base resolution → compress → emit row to the output
+//     DataChunk directly. Last finisher (`phase1_finished` lands on
+//     `native_tiles.size()`) wakes the Phase 2 init winner.
+//
+//   Phase 2 — Overview tiles (parallel + single-shot init)
+//     One thread (the "init winner", elected via
+//     `phase2_init_claimed`) waits for Phase 1 stragglers, then
+//     publishes the overview frame queue. All workers then pull from
+//     `overview_frames` via `next_overview_idx`. Each tile uses the
+//     COG fast path when source overviews exist, falling back to base
+//     warp otherwise. Results are pushed into the `overview_results`
+//     staging vector under a brief mutex; the staging is by design —
+//     it lets emission span multiple Execute() calls so we don't
+//     silently lose overview tiles past STANDARD_VECTOR_SIZE.
+//     Last Phase 2 finisher publishes `phase2_staged`.
+//
+//   Phase 3 — Drain + metadata (cooperative)
+//     Any worker can drain `overview_results` into output DataChunks
+//     via `overview_drain_idx`. Once drained, exactly one thread
+//     (elected via `metadata_emitted` CAS) builds and emits the
+//     `block=0` metadata row. After that, `finished` is set and all
+//     subsequent Execute() calls return zero rows.
+//
+// All cross-phase synchronization runs through one mutex/condvar
+// pair (`wait_mutex` / `wait_cv`); waiters use predicates that read
+// the relevant atomic.
+//
+// Set RAQUET_DEBUG_TIMING=1 to emit `[raquet-phase] ...` markers on
+// stderr at each transition.
 // ─────────────────────────────────────────────
 struct ReadRasterGlobalState : public GlobalTableFunctionState {
     // Phase 1: Native-zoom tiles (parallel-safe, mutex-protected queue)
@@ -998,6 +1055,15 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
             else if (v == "off")  bind_data->sparsity_probe = SparsityProbe::Off;
             else throw InvalidInputException(
                 "sparsity_probe must be 'auto', 'on', or 'off'");
+        } else if (kv.first == "sparsity_probe_size") {
+            int n = kv.second.GetValue<int32_t>();
+            if (n < 4) {
+                throw InvalidInputException(
+                    "sparsity_probe_size must be >= 4 (got %d) — anything "
+                    "smaller has too few mask cells to be statistically "
+                    "meaningful", n);
+            }
+            bind_data->sparsity_probe_size = n;
         } else if (kv.first == "bands") {
             // 'all' (case-insensitive) or empty → defer to default fill below.
             // Otherwise: comma-separated list of 1-based source-band indices.
@@ -1062,6 +1128,14 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
     if (bind_data->raster_band_count == 0) {
         GDALClose(ds);
         throw InvalidInputException("Raster file has no bands: %s", bind_data->filename);
+    }
+
+    // Cap sparsity_probe_size at block_size — anything finer than the
+    // destination tile size is meaningless (the probe is checking whether
+    // a future destination tile would be empty; sub-tile resolution gives
+    // no extra signal).
+    if (bind_data->sparsity_probe_size > bind_data->block_size) {
+        bind_data->sparsity_probe_size = bind_data->block_size;
     }
 
     // Resolve `bands` filter: if the user didn't specify (or passed 'all'),
@@ -1602,10 +1676,12 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - state.init_start).count();
             if (state.phase1_first_ns.compare_exchange_strong(expected, now_ns)) {
-                fprintf(stderr, "[raquet-phase] phase1_first @ %.3fs (native_tiles=%zu, threads=%d)\n",
-                        now_ns / 1e9, state.native_tiles.size(),
-                        static_cast<int>(state.MaxThreads()));
-                fflush(stderr);
+                if (DebugTimingEnabled()) {
+                    fprintf(stderr, "[raquet-phase] phase1_first @ %.3fs (native_tiles=%zu, threads=%d)\n",
+                            now_ns / 1e9, state.native_tiles.size(),
+                            static_cast<int>(state.MaxThreads()));
+                    fflush(stderr);
+                }
             }
         }
 
@@ -1636,7 +1712,8 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                     local.src_ds, local.warp_transformer,
                     bind_data.block_size,
                     bind_data.band_nodatas, bind_data.band_has_nodata,
-                    bind_data.band_is_empty);
+                    bind_data.band_is_empty,
+                    bind_data.sparsity_probe_size);
             }
         }
 
@@ -1718,16 +1795,18 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                         std::chrono::steady_clock::now() - state.init_start).count();
                     state.phase1_done_ns.store(now_ns, std::memory_order_release);
                     state.phase2_init_ns.store(now_ns, std::memory_order_release);
-                    int64_t p1_first = state.phase1_first_ns.load(std::memory_order_acquire);
-                    fprintf(stderr,
-                        "[raquet-phase] phase1_done @ %.3fs (phase1_wall=%.3fs, "
-                        "native_tiles=%zu, emitted=%d, overview_frames=%zu)\n",
-                        now_ns / 1e9,
-                        (now_ns - p1_first) / 1e9,
-                        state.native_tiles.size(),
-                        state.total_blocks.load(),
-                        state.overview_frames.size());
-                    fflush(stderr);
+                    if (DebugTimingEnabled()) {
+                        int64_t p1_first = state.phase1_first_ns.load(std::memory_order_acquire);
+                        fprintf(stderr,
+                            "[raquet-phase] phase1_done @ %.3fs (phase1_wall=%.3fs, "
+                            "native_tiles=%zu, emitted=%d, overview_frames=%zu)\n",
+                            now_ns / 1e9,
+                            (now_ns - p1_first) / 1e9,
+                            state.native_tiles.size(),
+                            state.total_blocks.load(),
+                            state.overview_frames.size());
+                        fflush(stderr);
+                    }
                 }
                 state.phase2_init_done.store(true, std::memory_order_release);
                 // Wake siblings waiting on phase2_init_done, plus any thread
@@ -1798,7 +1877,8 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                         local.src_ds, local.warp_transformer,
                         bind_data.block_size,
                         bind_data.band_nodatas, bind_data.band_has_nodata,
-                        bind_data.band_is_empty);
+                        bind_data.band_is_empty,
+                        bind_data.sparsity_probe_size);
                 }
             }
 
@@ -1851,16 +1931,18 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                     int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - state.init_start).count();
                     state.phase2_staged_ns.store(now_ns, std::memory_order_release);
-                    int64_t p2_init = state.phase2_init_ns.load(std::memory_order_acquire);
-                    fprintf(stderr,
-                        "[raquet-phase] phase2_staged @ %.3fs (phase2_wall=%.3fs, "
-                        "overview_frames=%zu, staged=%zu, total_blocks=%d)\n",
-                        now_ns / 1e9,
-                        (now_ns - p2_init) / 1e9,
-                        total_frames,
-                        state.overview_results.size(),
-                        state.total_blocks.load());
-                    fflush(stderr);
+                    if (DebugTimingEnabled()) {
+                        int64_t p2_init = state.phase2_init_ns.load(std::memory_order_acquire);
+                        fprintf(stderr,
+                            "[raquet-phase] phase2_staged @ %.3fs (phase2_wall=%.3fs, "
+                            "overview_frames=%zu, staged=%zu, total_blocks=%d)\n",
+                            now_ns / 1e9,
+                            (now_ns - p2_init) / 1e9,
+                            total_frames,
+                            state.overview_results.size(),
+                            state.total_blocks.load());
+                        fflush(stderr);
+                    }
                 }
                 state.phase2_staged.store(true, std::memory_order_release);
                 { std::lock_guard<std::mutex> lk(state.wait_mutex); }
@@ -1921,14 +2003,16 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - state.init_start).count();
             state.phase3_done_ns.store(now_ns, std::memory_order_release);
-            int64_t p2_staged = state.phase2_staged_ns.load(std::memory_order_acquire);
-            fprintf(stderr,
-                "[raquet-phase] phase3_metadata @ %.3fs (drain+meta_wall=%.3fs, "
-                "total_blocks=%d)\n",
-                now_ns / 1e9,
-                (now_ns - p2_staged) / 1e9,
-                state.total_blocks.load());
-            fflush(stderr);
+            if (DebugTimingEnabled()) {
+                int64_t p2_staged = state.phase2_staged_ns.load(std::memory_order_acquire);
+                fprintf(stderr,
+                    "[raquet-phase] phase3_metadata @ %.3fs (drain+meta_wall=%.3fs, "
+                    "total_blocks=%d)\n",
+                    now_ns / 1e9,
+                    (now_ns - p2_staged) / 1e9,
+                    state.total_blocks.load());
+                fflush(stderr);
+            }
         }
         // Build metadata
         raquet::RaquetMetadata meta;
@@ -2073,6 +2157,7 @@ void RegisterReadRaster(ExtensionLoader &loader) {
     func.named_parameters["format"] = LogicalType::VARCHAR;
     func.named_parameters["approx"] = LogicalType::BOOLEAN;
     func.named_parameters["sparsity_probe"] = LogicalType::VARCHAR;
+    func.named_parameters["sparsity_probe_size"] = LogicalType::INTEGER;
     func.named_parameters["bands"] = LogicalType::VARCHAR;
     func.cardinality = ReadRasterCardinality;
 

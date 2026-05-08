@@ -60,9 +60,11 @@ The `read_raster()` table function converts raster files to raquet format:
 1. **Bind**: Opens raster with GDAL, detects CRS/bands/resolution, calculates zoom, defines output schema
 2. **InitGlobal**: Builds native-zoom tile list and overview frame list
 3. **InitLocal**: Each thread opens its own `GDALDatasetH` handle (GDAL is not thread-safe per handle)
-4. **Execute (Phase 1)**: Native-zoom tiles processed in parallel — threads pull from mutex-protected queue
-5. **Execute (Phase 2)**: Overview tiles processed single-threaded (depend on child tiles)
-6. **Execute (Phase 3)**: Metadata row emitted last (block=0)
+4. **Execute (Phase 1)**: Native-zoom tiles processed in parallel — threads pull from mutex-protected queue, warp from source base resolution, emit rows directly to the output DataChunk.
+5. **Execute (Phase 2)**: Overview tiles processed in parallel via a work queue — one thread (the init winner) waits for Phase 1 stragglers and publishes `overview_frames`, then all workers pull from it. Uses COG fast path when source overviews exist (reads matching source overview level instead of re-warping from base). Results staged in `overview_results` so emission can span multiple Execute() calls.
+6. **Execute (Phase 3)**: Drain staged overview rows into output DataChunks; finally emit the metadata row at `block=0` (exactly once, via CAS on `metadata_emitted`).
+
+Set `RAQUET_DEBUG_TIMING=1` to emit per-phase wall-time markers to stderr (`[raquet-phase] ...`). See `src/raster/read_raster.cpp` near `ReadRasterGlobalState` for the detailed state-machine doc.
 
 Pipeline per tile: `CreateTileDataset → WarpIntoTile → IsTileEmpty → ReadAndCompressBands → EmitTileRow`
 
