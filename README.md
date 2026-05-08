@@ -242,9 +242,13 @@ SELECT * FROM read_raster(file, [named parameters...])
 | `zoom_strategy` | `VARCHAR` | `'auto'` | Zoom selection: `auto` (round), `lower` (floor, coarser), `upper` (ceil, finer) |
 | `format` | `VARCHAR` | `'v0.5.0'` | Metadata format: `'v0.5.0'` (spec) or `'v0'` (legacy v0.1.0 shape, drop-in compatible with Python `raster-loader 0.9.1` output — adds `quantiles`, `top_values`, per-band `nodata`, `stats.version` over the bare v0.1.0 spec) |
 | `approx` | `BOOLEAN` | `true` | Use GDAL's `approxOK=TRUE` overview-based statistics for the basic per-band stats (fast). Set `false` for an exact full-resolution scan. The flag also controls whether `quantiles` and `top_values` are computed from a 1000-pixel sample (approx) or from a full-band histogram (exact). Honoured by both `'v0'` and `'v0.5.0'` output formats |
+| `bands` | `VARCHAR` | `'all'` | Source-band filter: `'all'` (every source band, in source order) or a comma-separated list of 1-based source-band indices, e.g. `'2'`, `'2,4,5'`, `'5,2'` (reordering allowed). Output schema is dense `band_1..band_N` regardless of source indices; the source mapping is preserved in `metadata.bands[i].source_band`. |
+| `sparsity_probe` | `VARCHAR` | `'auto'` | Pre-warp empty-tile detection: `'auto'`, `'on'`, `'off'`. Auto enables the IO probe when bind-time stats show `max(valid_percent across selected bands) < 95%`. `'off'` disables both the geometric pre-check and the IO probe (pre-fix path). On globe-extent rasters with sparse coverage, the probe avoids decompressing thousands of empty tiles before the warp. |
+| `sparsity_probe_size` | `INTEGER` | `32` | Mask buffer dimension (NxN) for the IO probe. Min 4, capped at `block_size`. Smaller values (e.g. 8) are faster but on sparse rasters whose source overviews were built with `gdaladdo -r nearest` they can produce false-positive empty (nearest-resampled overview pixels lose sparse signal). 32 is the empirically-validated balance. |
 
 **Output columns:** `block` (UBIGINT), `metadata` (VARCHAR), `band_1` ... `band_N` (BLOB).
 When `statistics=true`, adds `band_N_count`, `band_N_min`, `band_N_max`, `band_N_sum`, `band_N_mean`, `band_N_stddev` columns.
+When `bands` is used, `N` equals the number of selected bands and the schema is renumbered dense from `band_1` (source-band indices live in metadata, not in column names).
 
 **NetCDF time dimension:** When reading NetCDF files with CF time metadata, the time dimension info
 (`cf:units`, `cf:calendar`) is automatically included in the output metadata JSON.
@@ -253,6 +257,11 @@ When `statistics=true`, adds `band_N_count`, `band_N_min`, `band_N_max`, `band_N
 its own per-thread GDAL handle and pulls work off a shared atomic queue. Phase 2 (overview tiles)
 publishes a staged result queue when the last worker finishes warping, so partial-chunk emission
 across `Execute` calls is safe.
+
+**Debug timing:** set the env var `RAQUET_DEBUG_TIMING=1` (any non-empty value) to emit
+`[raquet-phase] phaseN @ Xs (...)` markers on stderr at every Phase 1 / Phase 2 / Phase 3
+transition. Useful for diagnosing slow conversions; off by default. See the in-source comment block
+above `ReadRasterGlobalState` (or `CLAUDE.md`) for the full state-machine semantics.
 
 **Typical workflow:**
 ```sql
@@ -263,6 +272,24 @@ TO 'output.parquet' (FORMAT parquet);
 -- Then query with read_raquet
 SELECT ST_RasterValue(block, band_1, ST_Point(lon, lat), metadata)
 FROM read_raquet('output.parquet');
+```
+
+**Sparse multi-band rasters (recommended workflow):** for rasters where some bands are
+much sparser than others (e.g. one band has 0.5% valid pixels, another has 60%), filter
+to the meaningful bands with `bands=` to skip the heavy ones. For very large multi-band
+rasters that exceed available memory when converting all bands together, use per-band
+conversion via `bands='1'`, `bands='2'`, ... and merge afterwards (a future
+`raquet_merge_bands` table function will handle the metadata-merge automatically;
+in the meantime, see `duckdb-raquet-scripts-and-tests/scripts/convert_raster.sh` for the
+wrapper).
+```sql
+-- Convert only bands 2, 4, 5 (skip the all-nearly-empty bands 1, 3)
+COPY (
+    SELECT * FROM read_raster('input.tif',
+        bands='2,4,5',
+        sparsity_probe='auto',
+        block_size=512)
+) TO 'output.parquet' (FORMAT parquet);
 ```
 
 ### Validation
