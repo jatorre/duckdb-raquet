@@ -277,11 +277,9 @@ FROM read_raquet('output.parquet');
 **Sparse multi-band rasters (recommended workflow):** for rasters where some bands are
 much sparser than others (e.g. one band has 0.5% valid pixels, another has 60%), filter
 to the meaningful bands with `bands=` to skip the heavy ones. For very large multi-band
-rasters that exceed available memory when converting all bands together, use per-band
-conversion via `bands='1'`, `bands='2'`, ... and merge afterwards (a future
-`raquet_merge_bands` table function will handle the metadata-merge automatically;
-in the meantime, see `duckdb-raquet-scripts-and-tests/scripts/convert_raster.sh` for the
-wrapper).
+rasters that exceed available memory when converting all bands together, convert each
+band separately with `bands='1'`, `bands='2'`, ... then stitch the per-band raquets
+together with `raquet_merge_bands` (see below).
 ```sql
 -- Convert only bands 2, 4, 5 (skip the all-nearly-empty bands 1, 3)
 COPY (
@@ -291,6 +289,58 @@ COPY (
         block_size=512)
 ) TO 'output.parquet' (FORMAT parquet);
 ```
+
+### raquet_merge_bands (Combine single-band raquets into a multi-band raquet)
+
+Joins a list of single-band raquet parquet files into one multi-band raquet, by `block`.
+The output schema is dense `band_1..band_N` in the order the inputs are passed; the merged
+metadata composes per-band stats/nodata from each input and renumbers `name` and
+`source_band` to match the output position.
+
+```sql
+SELECT * FROM raquet_merge_bands(LIST<VARCHAR>)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| (positional) | `LIST<VARCHAR>` | List of paths to single-band raquet parquet files. The order of the list determines the output band order (`inputs[0]` → `band_1`, `inputs[1]` → `band_2`, ...). Each input must contain exactly one band column named `band_1`. |
+
+**Validated at bind time across inputs** (mismatch raises `InvalidInputException`):
+`version`, `compression`, `block_resolution` / `pixel_resolution`, `bounds`, `width`, `height`,
+`minresolution` / `maxresolution`, `block_width` / `block_height`, top-level `dtype`, and the
+top-level `nodata` field. Per-band fields (stats, nodata as quoted strings inside `bands[i]`)
+are propagated from each input.
+
+**Output:**
+- `block` (UBIGINT), `metadata` (VARCHAR), `band_1` ... `band_N` (BLOB) — same shape as `read_raster()` output, ready for `COPY ... TO 'merged.parquet'` or direct `read_raquet()`.
+- The metadata row at `block=0` has the merged metadata. `num_blocks` is recomputed as the count of distinct blocks where any input had data, plus one for the metadata row.
+
+**How the join works:** an internal DuckDB connection runs a parallel hash-join across the inputs on the `block` column (full outer over the data rows of every input). Tiles where only a subset of inputs had data emit `NULL` BLOBs in the columns whose input lacked that block.
+
+**Typical workflow:**
+```sql
+-- 1. Convert each band separately (memory-efficient for huge multi-band rasters)
+COPY (SELECT * FROM read_raster('big.tif', bands='1', block_size=512))
+  TO 'b1.parquet' (FORMAT parquet);
+COPY (SELECT * FROM read_raster('big.tif', bands='2', block_size=512))
+  TO 'b2.parquet' (FORMAT parquet);
+COPY (SELECT * FROM read_raster('big.tif', bands='3', block_size=512))
+  TO 'b3.parquet' (FORMAT parquet);
+
+-- 2. Merge the per-band parquets (fast — pure metadata + parallel hash join)
+COPY (
+    SELECT * FROM raquet_merge_bands(['b1.parquet', 'b2.parquet', 'b3.parquet'])
+) TO 'merged.parquet' (FORMAT parquet);
+
+-- 3. Drop a band, reorder, or pick a subset — just change the input list
+COPY (
+    SELECT * FROM raquet_merge_bands(['b2.parquet', 'b3.parquet'])
+) TO 'merged_no_b1.parquet' (FORMAT parquet);
+```
+
+**Notes:**
+- `source_band` in the output metadata always equals the output position (`i+1`); the *original* source-band index from each input is overwritten on merge. If you need to preserve the original mapping, record it externally before merging.
+- `raquet_merge_bands` does not re-run sparsity filtering — the input rows are taken as-is. If an input contains tiles that are entirely nodata for that band, those tiles will appear in the merged output (with non-null BLOBs) unless filtering happened during the per-band `read_raster` step.
 
 ### Validation
 
