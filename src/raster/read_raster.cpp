@@ -3,7 +3,7 @@
 #include "read_raster.hpp"
 #include "band_encoder.hpp"
 #include "band_decoder.hpp"
-#include "band_stats_v01.hpp"
+#include "band_stats.hpp"
 #include "raquet_metadata.hpp"
 #include "quadbin.hpp"
 #include "proj_embed.hpp"
@@ -1228,26 +1228,26 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         // dicts when the band is too sparse — emitted as `{}` by the
         // serializer.
         raquet::BandInfo::Stats st;
-        auto v01 = raquet::compute_v01_band_stats(
+        auto stats = raquet::compute_band_stats(
             band,
             bind_data->raster_width, bind_data->raster_height,
             has_nd ? nd : 0.0, has_nd != 0,
             bind_data->gdal_dtype,
             bind_data->approx_stats);
-        if (v01.has_stats) {
-            st.count         = v01.count;
-            st.min           = v01.min;
-            st.max           = v01.max;
-            st.mean          = v01.mean;
-            st.stddev        = v01.stddev;
-            st.sum           = v01.sum;
-            st.sum_squares   = v01.sum_squares;
-            st.valid_percent = v01.valid_percent;
-            st.approximated  = v01.approximated;
+        if (stats.has_stats) {
+            st.count         = stats.count;
+            st.min           = stats.min;
+            st.max           = stats.max;
+            st.mean          = stats.mean;
+            st.stddev        = stats.stddev;
+            st.sum           = stats.sum;
+            st.sum_squares   = stats.sum_squares;
+            st.valid_percent = stats.valid_percent;
+            st.approximated  = stats.approximated;
             st.has_stats     = true;
-            st.version       = std::move(v01.version);
-            st.quantiles     = std::move(v01.quantiles);
-            st.top_values    = std::move(v01.top_values);
+            st.version       = std::move(stats.version);
+            st.quantiles     = std::move(stats.quantiles);
+            st.top_values    = std::move(stats.top_values);
         }
         bind_data->band_stats.push_back(st);
     }
