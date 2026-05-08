@@ -375,7 +375,15 @@ static std::string MergeMetadata(const std::vector<std::string> &paths,
         band_entries.push_back(bands.substr(vs, ve - vs));
     }
 
-    // Step 2: renumber each band's "name" field.
+    // Step 2: renumber each band's "name" AND "source_band" to its
+    // position in the merged raster (1..N). The output is a new
+    // self-contained multi-band raquet — the band at output position
+    // i+1 IS source band i+1 of THIS raster (regardless of which
+    // input file it came from). Leaving source_band as the original
+    // source-band index from the input parquet would confuse readers
+    // that use source_band to determine the default band to render
+    // (CARTO Builder defaults to source_band=1, which won't match the
+    // intended output column 1 if we don't renumber).
     for (size_t i = 0; i < band_entries.size(); i++) {
         std::string &b = band_entries[i];
         size_t name_colon = FindTopLevelKey(b, 0, b.size(), "name");
@@ -386,6 +394,14 @@ static std::string MergeMetadata(const std::vector<std::string> &paths,
         auto [vs, ve] = ReadJSONValue(b, name_colon + 1, b.size());
         std::string new_name = "\"band_" + std::to_string(i + 1) + "\"";
         b = b.substr(0, vs) + new_name + b.substr(ve);
+
+        // Also replace source_band if present (the per-band source-band
+        // tracking from the bands= filter feature in PR #7).
+        size_t src_colon = FindTopLevelKey(b, 0, b.size(), "source_band");
+        if (src_colon != std::string::npos) {
+            auto [svs, sve] = ReadJSONValue(b, src_colon + 1, b.size());
+            b = b.substr(0, svs) + std::to_string(i + 1) + b.substr(sve);
+        }
     }
 
     // Step 3: build the top-level nodata array.
