@@ -186,6 +186,20 @@ static std::string Unquote(const std::string &raw) {
     return out;
 }
 
+// Replace the value of a top-level JSON object field with `new_value`
+// (which must be a complete, well-formed JSON value: a quoted string,
+// number, array, or object). Returns the original JSON unchanged if the
+// field is absent.
+static std::string ReplaceTopLevelField(std::string json, const std::string &key,
+                                          const std::string &new_value) {
+    size_t colon = FindTopLevelKey(json, 0, json.size(), key);
+    if (colon == std::string::npos) {
+        return json;
+    }
+    auto [vs, ve] = ReadJSONValue(json, colon + 1, json.size());
+    return json.substr(0, vs) + new_value + json.substr(ve);
+}
+
 // ─────────────────────────────────────────────
 // Bind state
 // ─────────────────────────────────────────────
@@ -418,6 +432,38 @@ static std::string MergeMetadata(const std::vector<std::string> &paths,
 }
 
 // ─────────────────────────────────────────────
+// Count the number of distinct block IDs in the union of all inputs'
+// data rows (block != 0). This is what `num_blocks` should be in the
+// merged metadata — it can't be inferred from any single input.
+//
+// Uses UNION (not UNION ALL) so DuckDB dedups across inputs naturally.
+// ─────────────────────────────────────────────
+static int64_t CountMergedBlocks(ClientContext &context,
+                                  const std::vector<std::string> &paths) {
+    if (paths.empty()) return 0;
+
+    std::stringstream sql;
+    sql << "SELECT COUNT(*) FROM (";
+    for (size_t i = 0; i < paths.size(); i++) {
+        if (i > 0) sql << " UNION ";
+        sql << "SELECT block FROM read_parquet(" << SqlSingleQuote(paths[i])
+            << ") WHERE block != 0";
+    }
+    sql << ")";
+
+    Connection con(*context.db);
+    auto result = con.Query(sql.str());
+    if (result->HasError()) {
+        throw InvalidInputException(
+            "raquet_merge_bands: failed to count merged blocks: %s",
+            result->GetError());
+    }
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) return 0;
+    return chunk->GetValue(0, 0).GetValue<int64_t>();
+}
+
+// ─────────────────────────────────────────────
 // Build the data-join SQL: FULL OUTER JOIN of N parquet inputs on `block`.
 // Each input contributes its band_1 column under output name band_(i+1).
 // ─────────────────────────────────────────────
@@ -485,6 +531,13 @@ static unique_ptr<FunctionData> RaquetMergeBandsBind(
 
     // Validate + compose merged metadata.
     bind_data->merged_metadata = MergeMetadata(bind_data->input_paths, jsons);
+
+    // Recompute num_blocks: distinct block IDs in the union of all inputs'
+    // data rows. The composed metadata starts with input 0's value, which
+    // is wrong for any merge of >1 inputs (it's just one band's count).
+    int64_t merged_blocks = CountMergedBlocks(context, bind_data->input_paths);
+    bind_data->merged_metadata = ReplaceTopLevelField(
+        bind_data->merged_metadata, "num_blocks", std::to_string(merged_blocks));
 
     // Build the data-join SQL string for InitGlobal to execute.
     bind_data->join_sql = BuildJoinSQL(bind_data->input_paths);
