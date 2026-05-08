@@ -388,11 +388,33 @@ static std::string MergeMetadata(const std::vector<std::string> &paths,
         b = b.substr(0, vs) + new_name + b.substr(ve);
     }
 
-    // Step 3: extract per-band nodata, build top-level nodata array.
+    // Step 3: build the top-level nodata array.
+    //
+    // Use each input's TOP-LEVEL `nodata` field (scalar number in
+    // single-band raquet output — produced by `nodata_to_json`). Don't
+    // use bands[i].nodata, which raquet's v0 format quotes as a string
+    // ("255") for raster_loader compatibility — that's the per-band
+    // shape, not the top-level shape, and putting quoted strings in
+    // the top-level array confuses readers that expect numbers.
     std::vector<std::string> per_band_nodatas;
-    for (const auto &b : band_entries) {
-        std::string nd = TryExtractRawValue(b, "nodata");
-        per_band_nodatas.push_back(nd.empty() ? "null" : nd);
+    for (const auto &j : jsons) {
+        std::string nd = TryExtractRawValue(j, "nodata");
+        if (nd.empty()) {
+            per_band_nodatas.push_back("null");
+        } else if (!nd.empty() && nd.front() == '[') {
+            // Input was already multi-band (unusual for the merge use
+            // case but supported): extract its first element.
+            size_t pos = SkipWS(nd, 1);
+            if (pos < nd.size() - 1 && nd[pos] != ']') {
+                auto [vs, ve] = ReadJSONValue(nd, pos, nd.size() - 1);
+                per_band_nodatas.push_back(nd.substr(vs, ve - vs));
+            } else {
+                per_band_nodatas.push_back("null");
+            }
+        } else {
+            // Scalar number form — use directly.
+            per_band_nodatas.push_back(nd);
+        }
     }
 
     // Step 4: rebuild the merged metadata. Take input 0's JSON, then:
