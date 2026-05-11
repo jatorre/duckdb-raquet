@@ -643,21 +643,24 @@ static bool IsTileOutsideSource(GDALDatasetH src_ds, void *transformer,
 // average > 0; only fully-nodata pools produce 0. Catches sparse
 // coverage that nearest sub-sampling would silently drop.
 //
-// Bands with `band_is_empty[i]` skip the read entirely (known fully-
-// nodata at bind time). Returns false on any transformer/IO failure or
-// on missing nodata definitions, so the caller falls back to the regular
-// warp + post-warp IsTileEmpty path.
+// `band_*` vectors are indexed by output position (0-based dense, size =
+// selected_bands.size()); each entry corresponds to source band
+// `selected_bands[i]` (1-based). Bands with `band_is_empty[i]` skip the
+// read entirely (known fully-nodata at bind time). Returns false on any
+// transformer/IO failure or on missing nodata definitions, so the caller
+// falls back to the regular warp + post-warp IsTileEmpty path.
 // ─────────────────────────────────────────────
 static bool IsSourceWindowEmpty(GDALDatasetH src_ds, void *transformer,
                                  int dst_tile_size,
                                  const std::vector<double> &band_nodatas,
                                  const std::vector<bool> &band_has_nodata,
                                  const std::vector<bool> &band_is_empty,
+                                 const std::vector<int> &selected_bands,
                                  int probe = 32, int margin_px = 2) {
-    int band_count = GDALGetRasterCount(src_ds);
-    if (band_count == 0) return false;
-    if (static_cast<int>(band_has_nodata.size()) < band_count) return false;
-    for (int i = 0; i < band_count; i++) {
+    int n = static_cast<int>(selected_bands.size());
+    if (n == 0) return false;
+    if (static_cast<int>(band_has_nodata.size()) < n) return false;
+    for (int i = 0; i < n; i++) {
         if (!band_has_nodata[i]) return false;
     }
 
@@ -679,10 +682,10 @@ static bool IsSourceWindowEmpty(GDALDatasetH src_ds, void *transformer,
 
     std::vector<uint8_t> mask_buf(static_cast<size_t>(probe) * probe);
 
-    for (int b = 1; b <= band_count; b++) {
-        if (b - 1 < (int)band_is_empty.size() && band_is_empty[b - 1]) continue;
+    for (int i = 0; i < n; i++) {
+        if (i < (int)band_is_empty.size() && band_is_empty[i]) continue;
 
-        GDALRasterBandH band = GDALGetRasterBand(src_ds, b);
+        GDALRasterBandH band = GDALGetRasterBand(src_ds, selected_bands[i]);
         GDALRasterBandH mask = GDALGetMaskBand(band);
         if (!mask) return false;
 
@@ -1713,6 +1716,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                     bind_data.block_size,
                     bind_data.band_nodatas, bind_data.band_has_nodata,
                     bind_data.band_is_empty,
+                    bind_data.selected_bands,
                     bind_data.sparsity_probe_size);
             }
         }
@@ -1878,6 +1882,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                         bind_data.block_size,
                         bind_data.band_nodatas, bind_data.band_has_nodata,
                         bind_data.band_is_empty,
+                        bind_data.selected_bands,
                         bind_data.sparsity_probe_size);
                 }
             }
