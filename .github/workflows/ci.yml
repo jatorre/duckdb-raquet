@@ -22,6 +22,12 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build zlib1g-dev
 
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{ runner.os }}
+        max-size: 1G
+
     - name: Build extension (Release)
       run: |
         # actions/checkout@v4 fetches the duckdb submodule shallowly by default,
@@ -102,6 +108,12 @@ jobs:
     - name: Install dependencies
       run: |
         brew install cmake ninja
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{ runner.os }}
+        max-size: 1G
 
     - name: Build extension (Release)
       run: |
