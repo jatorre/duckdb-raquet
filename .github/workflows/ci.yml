@@ -22,6 +22,13 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build zlib1g-dev
 
+    # Mirrors the ccache strategy used by upstream DuckDB's extension CI
+    # template (extension-ci-tools/.github/workflows/_extension_distribution.yml):
+    # restore a per-OS ccache between runs so DuckDB's source tree (which
+    # accounts for the bulk of the compile work) is not rebuilt from scratch
+    # on every PR. DuckDB's CMakeLists auto-detects ccache via find_program,
+    # so having it on PATH at configure time is enough — no extra cmake flags
+    # are required.
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
@@ -109,6 +116,13 @@ jobs:
       run: |
         brew install cmake ninja
 
+    # Mirrors the ccache strategy used by upstream DuckDB's extension CI
+    # template (extension-ci-tools/.github/workflows/_extension_distribution.yml):
+    # restore a per-OS ccache between runs so DuckDB's source tree (which
+    # accounts for the bulk of the compile work) is not rebuilt from scratch
+    # on every PR. DuckDB's CMakeLists auto-detects ccache via find_program,
+    # so having it on PATH at configure time is enough — no extra cmake flags
+    # are required.
     - name: Setup ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
