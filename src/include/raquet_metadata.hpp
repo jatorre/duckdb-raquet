@@ -967,6 +967,19 @@ inline RaquetMetadata parse_metadata(const std::string &json) {
     meta.width = extract_json_int(json, "width", 0);
     meta.height = extract_json_int(json, "height", 0);
 
+    // Bounds: [W, S, E, N] in WGS84 — top-level in both v0.1.0 and v0.5.0.
+    {
+        std::vector<double> b;
+        std::vector<bool> hb;
+        extract_json_number_array(json, "bounds", b, hb);
+        if (b.size() >= 4) {
+            meta.bounds_minlon = b[0];
+            meta.bounds_minlat = b[1];
+            meta.bounds_maxlon = b[2];
+            meta.bounds_maxlat = b[3];
+        }
+    }
+
     parse_bands_full(json, meta.bands, meta.band_info);
 
     // v0.5.0: tile statistics

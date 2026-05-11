@@ -1,0 +1,213 @@
+# name: test/sql/merge_bands.test
+# description: raquet_merge_bands(LIST<VARCHAR>) — combine N single-band raquets
+#              into a multi-band raquet. Covers happy path for both metadata
+#              formats (v0.1.0 flat / v0.5.0 nested tiling), the recompute of
+#              num_blocks, band renaming + source_band renumbering, and the
+#              negative paths (multi-band input rejection, empty list,
+#              spatial-frame mismatch).
+# group: [raquet]
+
+require raquet
+
+require parquet
+
+require json
+
+# =============================================================================
+# Setup: produce single-band raquets from test_palette.tif (16×16, uint8,
+# single band) in both v0.5.0 (default) and v0 metadata formats. Since the
+# fixture has only one source band, the per-band raquets are byte-equivalent;
+# they're used here as N independent inputs to exercise the merge mechanics.
+# =============================================================================
+
+statement ok
+COPY (SELECT * FROM read_raster('test/data/test_palette.tif', bands='1'))
+TO 'duckdb_unittest_tempdir/mb_v050_a.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT * FROM read_raster('test/data/test_palette.tif', bands='1'))
+TO 'duckdb_unittest_tempdir/mb_v050_b.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT * FROM read_raster('test/data/test_palette.tif', bands='1'))
+TO 'duckdb_unittest_tempdir/mb_v050_c.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT * FROM read_raster('test/data/test_palette.tif', bands='1', format='v0'))
+TO 'duckdb_unittest_tempdir/mb_v0_a.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT * FROM read_raster('test/data/test_palette.tif', bands='1', format='v0'))
+TO 'duckdb_unittest_tempdir/mb_v0_b.parquet' (FORMAT PARQUET);
+
+# =============================================================================
+# v0.5.0 (default) — 3-band merge
+# =============================================================================
+
+statement ok
+CREATE TABLE merged_v050 AS
+SELECT * FROM raquet_merge_bands([
+  'duckdb_unittest_tempdir/mb_v050_a.parquet',
+  'duckdb_unittest_tempdir/mb_v050_b.parquet',
+  'duckdb_unittest_tempdir/mb_v050_c.parquet'
+])
+
+# Schema: block, metadata, band_1, band_2, band_3
+query I
+SELECT count(*) FROM information_schema.columns WHERE table_name = 'merged_v050'
+----
+5
+
+# Version preserved from inputs
+query I
+SELECT json_extract_string(metadata, '$.version') FROM merged_v050 WHERE block = 0
+----
+0.5.0
+
+# Output uses v0.5.0 nested-tiling shape (key test for the parse_metadata
+# round-trip — pre-refactor, the splice approach silently no-op'd on
+# nested fields).
+query I
+SELECT metadata LIKE '%"tiling"%' FROM merged_v050 WHERE block = 0
+----
+true
+
+# Band names renumbered to output position
+query III
+SELECT json_extract_string(metadata, '$.bands[0].name'),
+       json_extract_string(metadata, '$.bands[1].name'),
+       json_extract_string(metadata, '$.bands[2].name')
+FROM merged_v050 WHERE block = 0
+----
+band_1	band_2	band_3
+
+# source_band renumbered to output position (1..N), independent of each
+# input's original source_band. Critical: regression test for the dedicated
+# fix-commit on the original PR.
+query III
+SELECT json_extract(metadata, '$.bands[0].source_band')::INT,
+       json_extract(metadata, '$.bands[1].source_band')::INT,
+       json_extract(metadata, '$.bands[2].source_band')::INT
+FROM merged_v050 WHERE block = 0
+----
+1	2	3
+
+# num_blocks recomputed and emitted under tiling. Pre-refactor, the splice
+# approach matched only top-level keys (depth=1) and silently no-op'd here,
+# leaving input 0's count in place — this assertion catches that regression.
+query I
+SELECT json_extract(metadata, '$.tiling.num_blocks')::INT = (SELECT count(*) FROM merged_v050 WHERE block != 0)
+FROM merged_v050 WHERE block = 0
+----
+true
+
+# Bounds preserved (was unreachable through the splice path; now exercised
+# via the parse_metadata round-trip).
+query I
+SELECT json_array_length(json_extract(metadata, '$.bounds'))
+FROM merged_v050 WHERE block = 0
+----
+4
+
+# Per-band properties (colortable, STATISTICS_*) survive the round-trip
+query I
+SELECT json_array_length(json_extract(metadata, '$.bands[1].colortable."1"'))
+FROM merged_v050 WHERE block = 0
+----
+4
+
+# =============================================================================
+# v0.1.0 ("v0") — 2-band merge
+# =============================================================================
+
+statement ok
+CREATE TABLE merged_v0 AS
+SELECT * FROM raquet_merge_bands([
+  'duckdb_unittest_tempdir/mb_v0_a.parquet',
+  'duckdb_unittest_tempdir/mb_v0_b.parquet'
+])
+
+# Version preserved from v0 inputs
+query I
+SELECT json_extract_string(metadata, '$.version') FROM merged_v0 WHERE block = 0
+----
+0.1.0
+
+# Output uses v0 flat shape (no nested tiling object)
+query I
+SELECT metadata LIKE '%"tiling"%' FROM merged_v0 WHERE block = 0
+----
+false
+
+# v0 has flat top-level num_blocks. Recomputed correctly here.
+query I
+SELECT json_extract(metadata, '$.num_blocks')::INT = (SELECT count(*) FROM merged_v0 WHERE block != 0)
+FROM merged_v0 WHERE block = 0
+----
+true
+
+# v0 emits top-level "nodata" as an array of N entries (one per band) for
+# multi-band outputs. Regression test for the original "quoted-string vs
+# numeric" issue called out in the manual-fix commit.
+query I
+SELECT json_array_length(json_extract(metadata, '$.nodata'))
+FROM merged_v0 WHERE block = 0
+----
+2
+
+# bands[i].source_band renumbered to output position (1, 2) in v0 too
+query II
+SELECT json_extract(metadata, '$.bands[0].source_band')::INT,
+       json_extract(metadata, '$.bands[1].source_band')::INT
+FROM merged_v0 WHERE block = 0
+----
+1	2
+
+# =============================================================================
+# Negative paths
+# =============================================================================
+
+# Empty list → InvalidInputException at bind time
+statement error
+SELECT * FROM raquet_merge_bands(CAST([] AS VARCHAR[]))
+----
+input list is empty
+
+# NULL list → InvalidInputException
+statement error
+SELECT * FROM raquet_merge_bands(CAST(NULL AS VARCHAR[]))
+----
+input list cannot be NULL
+
+# Multi-band input rejection: feed a previously-merged 2-band raquet back
+# into raquet_merge_bands. test_palette.tif has only one source band so
+# we can't produce a multi-band raquet directly via `bands=` (which dedups
+# duplicate indices); instead we reuse the v050 merged output as input.
+statement ok
+COPY merged_v050
+TO 'duckdb_unittest_tempdir/mb_multi.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT * FROM raquet_merge_bands([
+  'duckdb_unittest_tempdir/mb_multi.parquet',
+  'duckdb_unittest_tempdir/mb_v050_a.parquet'
+])
+----
+only single-band inputs are supported
+
+# Spatial-frame mismatch: produce an input at a different zoom range so
+# min_zoom/max_zoom differs, then attempt to merge. Pre-refactor, this would
+# have silently composed corrupt output on v0.5.0 inputs (the splice path
+# only looked at depth-1 keys, missing the nested min_zoom/max_zoom). The
+# parse_metadata round-trip catches it at struct-comparison time.
+statement ok
+COPY (SELECT * FROM read_raster('test/data/test_palette.tif', bands='1', max_zoom=5))
+TO 'duckdb_unittest_tempdir/mb_v050_diff_zoom.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT * FROM raquet_merge_bands([
+  'duckdb_unittest_tempdir/mb_v050_a.parquet',
+  'duckdb_unittest_tempdir/mb_v050_diff_zoom.parquet'
+])
+----
+must share the same spatial frame

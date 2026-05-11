@@ -306,14 +306,14 @@ SELECT * FROM raquet_merge_bands(LIST<VARCHAR>)
 | (positional) | `LIST<VARCHAR>` | List of paths to single-band raquet parquet files. The order of the list determines the output band order (`inputs[0]` → `band_1`, `inputs[1]` → `band_2`, ...). Each input must contain exactly one band column named `band_1`. |
 
 **Validated at bind time across inputs** (mismatch raises `InvalidInputException`):
-`version`, `compression`, `block_resolution` / `pixel_resolution`, `bounds`, `width`, `height`,
-`minresolution` / `maxresolution`, `block_width` / `block_height`, top-level `dtype`, and the
-top-level `nodata` field. Per-band fields (stats, nodata as quoted strings inside `bands[i]`)
-are propagated from each input.
+`compression`, `crs`, `block_width`, `block_height`, `min_zoom`, `max_zoom`, `bounds`,
+`width`, `height`, and `bands[0].type`. Each input must be single-band; multi-band
+inputs are rejected with a clear error. Per-band fields (stats, colorinterp, colortable,
+nodata, description) are propagated from each input into the merged `bands[i]`.
 
 **Output:**
 - `block` (UBIGINT), `metadata` (VARCHAR), `band_1` ... `band_N` (BLOB) — same shape as `read_raster()` output, ready for `COPY ... TO 'merged.parquet'` or direct `read_raquet()`.
-- The metadata row at `block=0` has the merged metadata. `num_blocks` is recomputed as the count of distinct blocks where any input had data, plus one for the metadata row.
+- The metadata row at `block=0` carries the merged metadata in the same format as the inputs (v0.1.0 inputs produce a v0.1.0 merged metadata; v0.5.0 inputs produce a v0.5.0 merged metadata). `num_blocks` is recomputed as the count of distinct block IDs in the union of all inputs' data rows.
 
 **How the join works:** an internal DuckDB connection runs a parallel hash-join across the inputs on the `block` column (full outer over the data rows of every input). Tiles where only a subset of inputs had data emit `NULL` BLOBs in the columns whose input lacked that block.
 
