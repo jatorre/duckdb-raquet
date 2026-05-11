@@ -27,6 +27,7 @@ void RegisterClipFunctions(ExtensionLoader &loader);
 void RegisterBandMathFunctions(ExtensionLoader &loader);
 void RegisterMetadataFunctions(ExtensionLoader &loader);
 void RegisterRaquetTableFunctions(ExtensionLoader &loader);
+void RegisterMergeBandsFunction(ExtensionLoader &loader);
 
 // Table macro definitions for read_raquet with spatial filtering overloads
 // v0.3.0 format: metadata is in a row where block=0, data rows have block!=0
@@ -363,6 +364,7 @@ static void LoadInternal(ExtensionLoader &loader) {
     RegisterBandMathFunctions(loader);
     RegisterMetadataFunctions(loader);
     RegisterRaquetTableFunctions(loader);
+    RegisterMergeBandsFunction(loader);
 
     // Register read_raquet table macro with all overloads
     auto macro_info = CreateReadRaquetMacroInfo();

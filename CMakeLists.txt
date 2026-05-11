@@ -29,6 +29,7 @@ set(EXTENSION_SOURCES
     src/raster/band_math.cpp
     src/metadata/raquet_metadata.cpp
     src/table_functions/raquet_table_functions.cpp
+    src/table_functions/merge_bands.cpp
 )
 
 # Find zlib for gzip decompression
