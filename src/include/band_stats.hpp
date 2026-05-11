@@ -28,7 +28,7 @@ namespace raquet {
 // histogram of the full band — exact for fixed-bucket integer dtypes
 // (uint8/int8/uint16/int16), and exact-up-to-bin-width for wider
 // integer / float dtypes.
-struct V01BandStatsResult {
+struct BandStatsResult {
     int64_t count = 0;
     double  min = 0.0;
     double  max = 0.0;
@@ -50,7 +50,7 @@ struct V01BandStatsResult {
 // false`, GDAL does a full-resolution scan AND we run a streaming
 // pass over the band to build a histogram for exact quantiles /
 // top_values.
-V01BandStatsResult compute_v01_band_stats(
+BandStatsResult compute_band_stats(
     GDALRasterBandH band,
     int raster_width, int raster_height,
     double nodata, bool has_nodata,

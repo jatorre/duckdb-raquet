@@ -59,7 +59,7 @@ if(GDAL_FOUND)
     message(STATUS "GDAL support enabled (read_raster available)")
     list(APPEND EXTENSION_SOURCES
         src/raster/read_raster.cpp
-        src/raster/band_stats_v01.cpp)
+        src/raster/band_stats.cpp)
 
     # Find PROJ and SQLite3 for embedded proj.db support
     find_package(PROJ QUIET CONFIG)

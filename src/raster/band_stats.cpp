@@ -1,6 +1,6 @@
 #ifdef RAQUET_HAS_GDAL
 
-#include "band_stats_v01.hpp"
+#include "band_stats.hpp"
 
 #include <gdal.h>
 #include <cpl_error.h>
@@ -70,7 +70,7 @@ static bool extract_basic_stats(
     GDALRasterBandH band,
     int raster_width, int raster_height,
     bool approx,
-    V01BandStatsResult &out) {
+    BandStatsResult &out) {
 
     double smin = 0, smax = 0, smean = 0, sstddev = 0;
     CPLErr err = GDALComputeRasterStatistics(
@@ -338,14 +338,14 @@ static void quantiles_and_top_values_from_histogram(
 // ─────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────
-V01BandStatsResult compute_v01_band_stats(
+BandStatsResult compute_band_stats(
     GDALRasterBandH band,
     int raster_width, int raster_height,
     double nodata, bool has_nodata,
     GDALDataType dtype,
     bool approx) {
 
-    V01BandStatsResult r;
+    BandStatsResult r;
     r.version = kVersionTag;
     if (!band || raster_width <= 0 || raster_height <= 0) {
         return r;
