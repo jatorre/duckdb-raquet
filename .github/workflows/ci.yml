@@ -38,6 +38,49 @@ jobs:
       run: |
         make test
 
+    - name: Test with sample data
+      run: |
+        ./build/release/duckdb -c "
+          INSTALL json;
+          LOAD json;
+          LOAD 'build/release/extension/raquet/raquet.duckdb_extension';
+
+          -- Test basic query
+          SELECT count(*) as total_rows FROM read_parquet('test_data/raquet_test.parquet');
+
+          -- Test metadata extraction
+          SELECT
+            json_extract_string(metadata, '$.compression') as compression,
+            json_extract_string(metadata, '$.block_width') as block_width
+          FROM read_parquet('test_data/raquet_test.parquet')
+          WHERE block = 0;
+
+          -- Test QUADBIN functions. DuckDB 1.5.2's parser rejects
+          -- (struct_returning_func()).*; use explicit field accessors
+          -- against the STRUCT(min_lon, min_lat, max_lon, max_lat) returned
+          -- by quadbin_to_bbox.
+          SELECT
+            block,
+            quadbin_resolution(block) as zoom,
+            (quadbin_to_bbox(block)).min_lon as min_lon,
+            (quadbin_to_bbox(block)).min_lat as min_lat,
+            (quadbin_to_bbox(block)).max_lon as max_lon,
+            (quadbin_to_bbox(block)).max_lat as max_lat
+          FROM read_parquet('test_data/raquet_test.parquet')
+          WHERE block != 0
+          LIMIT 3;
+
+          -- Test pixel extraction
+          SELECT
+            block,
+            raquet_pixel(band_1, 'uint8', 128, 128, 256, 'gzip') as pixel_value
+          FROM read_parquet('test_data/raquet_test.parquet')
+          WHERE block != 0
+          LIMIT 3;
+
+          SELECT 'All tests passed!' as status;
+        "
+
     - name: Upload build artifacts
       if: always()
       uses: actions/upload-artifact@v4
@@ -84,68 +127,3 @@ jobs:
         path: build/release/extension/raquet/raquet.duckdb_extension
         if-no-files-found: warn
 
-  test-with-sample-data:
-    name: Test with Sample Data
-    runs-on: ubuntu-latest
-    needs: build-linux
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake ninja-build zlib1g-dev curl
-
-    - name: Build extension
-      run: |
-        # See note in build-linux job for why OVERRIDE_GIT_DESCRIBE is needed.
-        export OVERRIDE_GIT_DESCRIBE="v1.5.2-0-g$(cd duckdb && git rev-parse --short=10 HEAD)"
-        echo "OVERRIDE_GIT_DESCRIBE=$OVERRIDE_GIT_DESCRIBE"
-        make release
-
-    - name: Test with sample data
-      run: |
-        ./build/release/duckdb -c "
-          INSTALL json;
-          LOAD json;
-          LOAD 'build/release/extension/raquet/raquet.duckdb_extension';
-
-          -- Test basic query
-          SELECT count(*) as total_rows FROM read_parquet('test_data/raquet_test.parquet');
-
-          -- Test metadata extraction
-          SELECT
-            json_extract_string(metadata, '$.compression') as compression,
-            json_extract_string(metadata, '$.block_width') as block_width
-          FROM read_parquet('test_data/raquet_test.parquet')
-          WHERE block = 0;
-
-          -- Test QUADBIN functions. DuckDB 1.5.2's parser rejects
-          -- (struct_returning_func()).*; use explicit field accessors
-          -- against the STRUCT(min_lon, min_lat, max_lon, max_lat) returned
-          -- by quadbin_to_bbox.
-          SELECT
-            block,
-            quadbin_resolution(block) as zoom,
-            (quadbin_to_bbox(block)).min_lon as min_lon,
-            (quadbin_to_bbox(block)).min_lat as min_lat,
-            (quadbin_to_bbox(block)).max_lon as max_lon,
-            (quadbin_to_bbox(block)).max_lat as max_lat
-          FROM read_parquet('test_data/raquet_test.parquet')
-          WHERE block != 0
-          LIMIT 3;
-
-          -- Test pixel extraction
-          SELECT
-            block,
-            raquet_pixel(band_1, 'uint8', 128, 128, 256, 'gzip') as pixel_value
-          FROM read_parquet('test_data/raquet_test.parquet')
-          WHERE block != 0
-          LIMIT 3;
-
-          SELECT 'All tests passed!' as status;
-        "
