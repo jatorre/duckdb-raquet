@@ -26,3 +26,6 @@ Thumbs.db
 duckdb_unittest_tempdir/
 # GDAL stats sidecars written next to test rasters
 *.aux.xml
+
+# Claude Code workspace (plans, settings, worktrees)
+.claude/

@@ -19,6 +19,11 @@ struct BandInfo {
     double nodata;
     bool has_nodata;
 
+    // 1-based source-band index, preserved when the user filters bands via
+    // read_raster(..., bands='2,4,5'). Defaults to 0, which means "not
+    // tracked / single-band-style"; serializers may omit the field when 0.
+    int source_band = 0;
+
     // Extended band metadata (v0.3.0+)
     std::string description;
     std::string unit;
@@ -353,6 +358,15 @@ struct RaquetMetadata {
             const auto &bi = band_info[i];
             json += "{\"name\":\"" + bi.name + "\"";
             json += ",\"type\":\"" + bi.type + "\"";
+            // Source-band index — only emitted when set (i.e., when the
+            // user filtered bands via bands=). Preserves the mapping from
+            // the dense output band_N back to the original source band.
+            if (bi.source_band > 0) {
+                json += ",\"source_band\":" + std::to_string(bi.source_band);
+                if (!bi.description.empty()) {
+                    json += ",\"source_description\":\"" + bi.description + "\"";
+                }
+            }
             json += ",\"nodata\":" + nodata_to_json_v0_band(bi);
             json += ",\"colorinterp\":";
             if (bi.colorinterp.empty()) {
@@ -422,6 +436,12 @@ struct RaquetMetadata {
             const auto &bi = band_info[i];
             json += "{\"name\":\"" + bi.name + "\"";
             json += ",\"type\":\"" + bi.type + "\"";
+            // Source-band index — only emitted when the user filtered
+            // bands. Preserves the mapping from output band_N back to
+            // the original source band index.
+            if (bi.source_band > 0) {
+                json += ",\"source_band\":" + std::to_string(bi.source_band);
+            }
             if (bi.has_nodata) {
                 if (std::isnan(bi.nodata)) {
                     json += ",\"nodata\":\"NaN\"";

@@ -28,14 +28,31 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace duckdb {
+
+// ─────────────────────────────────────────────
+// Debug-timing instrumentation: only emits stderr lines when the env
+// var RAQUET_DEBUG_TIMING is set (any non-empty value). Cached on first
+// read to avoid repeated getenv() calls. The atomic timestamp stores in
+// the global state run unconditionally — they're cheap and harmless.
+// ─────────────────────────────────────────────
+static bool DebugTimingEnabled() {
+    static const bool enabled = []() {
+        const char *v = std::getenv("RAQUET_DEBUG_TIMING");
+        return v != nullptr && v[0] != '\0';
+    }();
+    return enabled;
+}
 
 // ─────────────────────────────────────────────
 // GDAL type → raquet BandDataType string mapping
@@ -93,6 +110,14 @@ struct RasterTile {
 };
 
 // ─────────────────────────────────────────────
+// User-controlled mode for the pre-warp sparsity probe.
+// Auto enables the probe only when bind-time stats indicate the raster is
+// non-trivially sparse; On forces it; Off disables both the probe and the
+// always-free geometric pre-check, restoring pre-patch behavior.
+// ─────────────────────────────────────────────
+enum class SparsityProbe { Auto, On, Off };
+
+// ─────────────────────────────────────────────
 // Bind data — holds everything discovered at bind time
 // ─────────────────────────────────────────────
 struct ReadRasterBindData : public TableFunctionData {
@@ -145,6 +170,27 @@ struct ReadRasterBindData : public TableFunctionData {
     std::string zoom_strategy = "auto"; // auto, lower, upper
     std::string output_format = "v0.5.0"; // v0 or v0.5.0
 
+    // Sparsity-aware tile pipeline
+    SparsityProbe sparsity_probe = SparsityProbe::Auto;
+    bool sparsity_probe_active = false;     // resolved at bind time
+    std::vector<bool> band_is_empty;        // valid_percent <= 0 ⇒ true
+
+    // Mask-buffer dimension for the IO probe (32×32 default). Smaller values
+    // (8, 16) read fewer mask cells per probe — faster, but with sparse
+    // rasters whose source overviews were built with -r nearest, smaller
+    // probes can produce false-positive empty (tile dropped despite
+    // having valid pixels). 32 is the empirically-validated sweet spot.
+    // Capped at block_size (no point probing finer than the destination).
+    int sparsity_probe_size = 32;
+
+    // Band filter — 1-based source-band indices to emit, in output order.
+    // Empty after parsing means "use all source bands"; the post-parse fill
+    // populates 1..raster_band_count in that case so downstream code never
+    // sees an empty selection. Default value of the named parameter is
+    // 'all' (equivalent to omitting the parameter); a comma-separated list
+    // of indices ('2', '2,4,5', '5,2') overrides it.
+    std::vector<int> selected_bands;
+
     // CF time dimension (NetCDF)
     bool has_cf_time = false;
     std::string cf_units_string;        // e.g., "minutes since 1980-01-01 00:00:00"
@@ -188,7 +234,41 @@ struct OverviewFrame {
 };
 
 // ─────────────────────────────────────────────
-// Global state — two-phase: parallel native zoom, then single-thread overviews
+// Execution state machine — three phases, transitions enforced via the
+// atomic flags below.
+//
+//   Phase 1 — Native-zoom tiles (parallel)
+//     Workers pull from `native_tiles` via `next_tile_idx` (mutex
+//     protected). Each tile: pre-warp checks → `WarpIntoTile` from
+//     source base resolution → compress → emit row to the output
+//     DataChunk directly. Last finisher (`phase1_finished` lands on
+//     `native_tiles.size()`) wakes the Phase 2 init winner.
+//
+//   Phase 2 — Overview tiles (parallel + single-shot init)
+//     One thread (the "init winner", elected via
+//     `phase2_init_claimed`) waits for Phase 1 stragglers, then
+//     publishes the overview frame queue. All workers then pull from
+//     `overview_frames` via `next_overview_idx`. Each tile uses the
+//     COG fast path when source overviews exist, falling back to base
+//     warp otherwise. Results are pushed into the `overview_results`
+//     staging vector under a brief mutex; the staging is by design —
+//     it lets emission span multiple Execute() calls so we don't
+//     silently lose overview tiles past STANDARD_VECTOR_SIZE.
+//     Last Phase 2 finisher publishes `phase2_staged`.
+//
+//   Phase 3 — Drain + metadata (cooperative)
+//     Any worker can drain `overview_results` into output DataChunks
+//     via `overview_drain_idx`. Once drained, exactly one thread
+//     (elected via `metadata_emitted` CAS) builds and emits the
+//     `block=0` metadata row. After that, `finished` is set and all
+//     subsequent Execute() calls return zero rows.
+//
+// All cross-phase synchronization runs through one mutex/condvar
+// pair (`wait_mutex` / `wait_cv`); waiters use predicates that read
+// the relevant atomic.
+//
+// Set RAQUET_DEBUG_TIMING=1 to emit `[raquet-phase] ...` markers on
+// stderr at each transition.
 // ─────────────────────────────────────────────
 struct ReadRasterGlobalState : public GlobalTableFunctionState {
     // Phase 1: Native-zoom tiles (parallel-safe, mutex-protected queue)
@@ -251,6 +331,14 @@ struct ReadRasterGlobalState : public GlobalTableFunctionState {
 
     // Whether we need overviews at all
     bool has_overviews = false;
+
+    // Phase-timing instrumentation (debug). Recorded as ns-since-init_start.
+    std::chrono::steady_clock::time_point init_start;
+    std::atomic<int64_t> phase1_first_ns{-1};
+    std::atomic<int64_t> phase1_done_ns{-1};
+    std::atomic<int64_t> phase2_init_ns{-1};
+    std::atomic<int64_t> phase2_staged_ns{-1};
+    std::atomic<int64_t> phase3_done_ns{-1};
 
     idx_t MaxThreads() const override {
         return GlobalTableFunctionState::MAX_THREADS;
@@ -356,15 +444,16 @@ static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *wkt_3857,
 // geotransform is updated via GDALSetGenImgProjTransformerDstGeoTransform
 // and the warp uses the cached object.
 // ─────────────────────────────────────────────
-static void WarpIntoTile(ReadRasterLocalState &local, GDALDatasetH tile_ds,
-                          GDALResampleAlg resample, double nodata, bool has_nodata,
-                          int overview_level = -1) {
+// Build (or refresh) the per-thread warp transformer for `tile_ds` at the
+// requested source overview level. Same-level reuse just retargets the dst
+// geotransform — cheap. Different overview levels rebuild from scratch.
+// Lifted out of WarpIntoTile so the pre-warp emptiness checks can call it
+// before any warping happens.
+static void EnsureWarpTransformer(ReadRasterLocalState &local,
+                                   GDALDatasetH tile_ds,
+                                   int overview_level) {
     GDALDatasetH src_ds = local.src_ds;
-
     if (!local.warp_transformer || local.warp_transformer_overview_level != overview_level) {
-        // (Re)build the transformer. OVERVIEW_LEVEL belongs on the
-        // transformer (consumed by GDALCreateGenImgProjTransformer2 as
-        // SRC_OVERVIEW_LEVEL), not on GDALWarpOptions::papszWarpOptions.
         if (local.warp_transformer) {
             GDALDestroyGenImgProjTransformer(local.warp_transformer);
             local.warp_transformer = nullptr;
@@ -382,25 +471,32 @@ static void WarpIntoTile(ReadRasterLocalState &local, GDALDatasetH tile_ds,
         }
         local.warp_transformer_overview_level = overview_level;
     } else {
-        // Same overview level — reuse the cached transformer, just point
-        // it at the new tile's geotransform. Source CRS and source
-        // geotransform haven't changed; destination CRS hasn't changed
-        // either (every tile_ds is in EPSG:3857 with identical WKT).
         double dst_gt[6];
         GDALGetGeoTransform(tile_ds, dst_gt);
         GDALSetGenImgProjTransformerDstGeoTransform(local.warp_transformer, dst_gt);
     }
+}
+
+static void WarpIntoTile(ReadRasterLocalState &local, GDALDatasetH tile_ds,
+                          GDALResampleAlg resample, double nodata, bool has_nodata,
+                          const std::vector<int> &selected_bands,
+                          int overview_level = -1) {
+    GDALDatasetH src_ds = local.src_ds;
+    EnsureWarpTransformer(local, tile_ds, overview_level);
 
     GDALWarpOptions *wo = GDALCreateWarpOptions();
     wo->hSrcDS = src_ds;
     wo->hDstDS = tile_ds;
     wo->eResampleAlg = resample;
-    wo->nBandCount = GDALGetRasterCount(src_ds);
+    // Output band count = selected bands. panSrcBands maps each output band
+    // to the corresponding 1-based source band index; panDstBands is dense
+    // 1..N (the destination tile was created with N = selected.size() bands).
+    wo->nBandCount = static_cast<int>(selected_bands.size());
 
     wo->panSrcBands = static_cast<int *>(CPLMalloc(sizeof(int) * wo->nBandCount));
     wo->panDstBands = static_cast<int *>(CPLMalloc(sizeof(int) * wo->nBandCount));
     for (int i = 0; i < wo->nBandCount; i++) {
-        wo->panSrcBands[i] = i + 1;
+        wo->panSrcBands[i] = selected_bands[i];
         wo->panDstBands[i] = i + 1;
     }
 
@@ -439,44 +535,223 @@ static void WarpIntoTile(ReadRasterLocalState &local, GDALDatasetH tile_ds,
 }
 
 // ─────────────────────────────────────────────
+// Helper: Decode a single pixel from a typed buffer into a double.
+// Returns false on unsupported dtype (caller should bail conservatively).
+// Shared by IsTileEmpty and IsSourceWindowEmpty.
+// ─────────────────────────────────────────────
+static bool DecodePixel(GDALDataType dt, const uint8_t *buf, size_t i, double &val) {
+    switch (dt) {
+        case GDT_Byte:    val = static_cast<double>(buf[i]); return true;
+        case GDT_Int8:    { int8_t v; memcpy(&v, buf + i, 1); val = v; return true; }
+        case GDT_Int16:   { int16_t v; memcpy(&v, buf + i * 2, 2); val = v; return true; }
+        case GDT_UInt16:  { uint16_t v; memcpy(&v, buf + i * 2, 2); val = v; return true; }
+        case GDT_Int32:   { int32_t v; memcpy(&v, buf + i * 4, 4); val = v; return true; }
+        case GDT_UInt32:  { uint32_t v; memcpy(&v, buf + i * 4, 4); val = v; return true; }
+        case GDT_Int64:   { int64_t v; memcpy(&v, buf + i * 8, 8); val = static_cast<double>(v); return true; }
+        case GDT_UInt64:  { uint64_t v; memcpy(&v, buf + i * 8, 8); val = static_cast<double>(v); return true; }
+        case GDT_Float32: { float v; memcpy(&v, buf + i * 4, 4); val = v; return true; }
+        case GDT_Float64: { memcpy(&val, buf + i * 8, 8); return true; }
+        default: return false;
+    }
+}
+
+// ─────────────────────────────────────────────
+// Helper: Compute the source-pixel window covered by a destination tile.
+// Back-projects the 4 corners (with `margin_px` slack to cover the
+// resampling kernel), clips to source raster bounds, and writes the
+// result into wx0/wy0/wx1/wy1. Returns false on transformer failure.
+// `outside_source` is set to true when the inflated bbox falls entirely
+// off the source raster (caller can short-circuit to "skip tile").
+// ─────────────────────────────────────────────
+static bool BackProjectTileToSource(GDALDatasetH src_ds, void *transformer,
+                                     int dst_tile_size, int margin_px,
+                                     int &wx0, int &wy0, int &wx1, int &wy1,
+                                     bool &outside_source) {
+    outside_source = false;
+    if (!transformer) return false;
+
+    double xs[4] = {0.0, (double)dst_tile_size, 0.0, (double)dst_tile_size};
+    double ys[4] = {0.0, 0.0, (double)dst_tile_size, (double)dst_tile_size};
+    double zs[4] = {0.0, 0.0, 0.0, 0.0};
+    int    ok[4] = {0, 0, 0, 0};
+    if (!GDALGenImgProjTransform(transformer, /*bDstToSrc=*/TRUE, 4,
+                                  xs, ys, zs, ok)) {
+        return false;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (!ok[i]) return false;
+    }
+
+    double xmin = xs[0], xmax = xs[0], ymin = ys[0], ymax = ys[0];
+    for (int i = 1; i < 4; i++) {
+        xmin = std::min(xmin, xs[i]); xmax = std::max(xmax, xs[i]);
+        ymin = std::min(ymin, ys[i]); ymax = std::max(ymax, ys[i]);
+    }
+
+    int sx = GDALGetRasterXSize(src_ds);
+    int sy = GDALGetRasterYSize(src_ds);
+
+    int x0 = (int)std::floor(xmin) - margin_px;
+    int y0 = (int)std::floor(ymin) - margin_px;
+    int x1 = (int)std::ceil(xmax)  + margin_px;
+    int y1 = (int)std::ceil(ymax)  + margin_px;
+
+    // If the inflated bbox is entirely off the source raster, the tile
+    // can only contain nodata (warp would fill with the dst nodata) — exact
+    // skip. We still report the clipped (empty) window so callers don't
+    // try to read it.
+    if (x1 <= 0 || y1 <= 0 || x0 >= sx || y0 >= sy) {
+        outside_source = true;
+        wx0 = wy0 = wx1 = wy1 = 0;
+        return true;
+    }
+
+    wx0 = std::max(0, x0);
+    wy0 = std::max(0, y0);
+    wx1 = std::min(sx, x1);
+    wy1 = std::min(sy, y1);
+    return wx1 > wx0 && wy1 > wy0;
+}
+
+// ─────────────────────────────────────────────
+// Helper: Free, IO-less geometric pre-check.
+// Returns true iff the dst tile back-projects entirely outside the source
+// raster's pixel extent — a guaranteed-empty tile.
+// ─────────────────────────────────────────────
+static bool IsTileOutsideSource(GDALDatasetH src_ds, void *transformer,
+                                 int dst_tile_size, int margin_px = 2) {
+    int wx0, wy0, wx1, wy1;
+    bool outside = false;
+    if (!BackProjectTileToSource(src_ds, transformer, dst_tile_size, margin_px,
+                                  wx0, wy0, wx1, wy1, outside)) {
+        return false;  // transformer failure — keep tile
+    }
+    return outside;
+}
+
+// ─────────────────────────────────────────────
+// Helper: Gated IO probe.
+// Reads the back-projected source window for each band's MASK (0 = nodata,
+// 255 = valid; GDAL synthesizes from nodata when no explicit mask band is
+// set) at sub-resolution (`probe` × `probe`) using AVERAGE resampling.
+//
+// Why mask + average instead of band + nearest:
+// Sub-sampling a sparse data band with nearest-neighbour can miss valid
+// pixels that fall between the sample grid points — false-positive empty.
+// Averaging the 0/255 mask across pooled cells preserves the "any valid
+// pixel exists" semantics: a pool with even one valid pixel produces
+// average > 0; only fully-nodata pools produce 0. Catches sparse
+// coverage that nearest sub-sampling would silently drop.
+//
+// `band_*` vectors are indexed by output position (0-based dense, size =
+// selected_bands.size()); each entry corresponds to source band
+// `selected_bands[i]` (1-based). Bands with `band_is_empty[i]` skip the
+// read entirely (known fully-nodata at bind time). Returns false on any
+// transformer/IO failure or on missing nodata definitions, so the caller
+// falls back to the regular warp + post-warp IsTileEmpty path.
+// ─────────────────────────────────────────────
+static bool IsSourceWindowEmpty(GDALDatasetH src_ds, void *transformer,
+                                 int dst_tile_size,
+                                 const std::vector<double> &band_nodatas,
+                                 const std::vector<bool> &band_has_nodata,
+                                 const std::vector<bool> &band_is_empty,
+                                 const std::vector<int> &selected_bands,
+                                 int probe = 32, int margin_px = 2) {
+    int n = static_cast<int>(selected_bands.size());
+    if (n == 0) return false;
+    if (static_cast<int>(band_has_nodata.size()) < n) return false;
+    for (int i = 0; i < n; i++) {
+        if (!band_has_nodata[i]) return false;
+    }
+
+    int wx0, wy0, wx1, wy1;
+    bool outside = false;
+    if (!BackProjectTileToSource(src_ds, transformer, dst_tile_size, margin_px,
+                                  wx0, wy0, wx1, wy1, outside)) {
+        return false;
+    }
+    if (outside) return true;
+
+    int wxs = wx1 - wx0;
+    int wys = wy1 - wy0;
+    if (wxs <= 0 || wys <= 0) return false;
+
+    GDALRasterIOExtraArg arg;
+    INIT_RASTERIO_EXTRA_ARG(arg);
+    arg.eResampleAlg = GRIORA_Average;
+
+    std::vector<uint8_t> mask_buf(static_cast<size_t>(probe) * probe);
+
+    for (int i = 0; i < n; i++) {
+        if (i < (int)band_is_empty.size() && band_is_empty[i]) continue;
+
+        GDALRasterBandH band = GDALGetRasterBand(src_ds, selected_bands[i]);
+        GDALRasterBandH mask = GDALGetMaskBand(band);
+        if (!mask) return false;
+
+        std::fill(mask_buf.begin(), mask_buf.end(), 0);
+        CPLErr err = GDALRasterIOEx(mask, GF_Read, wx0, wy0, wxs, wys,
+                                     mask_buf.data(), probe, probe,
+                                     GDT_Byte, 0, 0, &arg);
+        if (err != CE_None) return false;
+
+        for (uint8_t v : mask_buf) {
+            // Any non-zero pool means at least one valid pixel exists.
+            if (v != 0) return false;
+        }
+    }
+    return true;
+}
+
+// ─────────────────────────────────────────────
 // Helper: Check if a tile is entirely nodata (empty)
 // ─────────────────────────────────────────────
-static bool IsTileEmpty(GDALDatasetH ds, double nodata, bool has_nodata) {
-    if (!has_nodata) return false;
+// A tile is empty only if EVERY band is fully nodata. Short-circuits on the
+// first non-nodata pixel found in any band. Each band uses its own nodata
+// value (per-band nodata is allowed by GDAL). If any band lacks a defined
+// nodata, or the read fails, returns false (keep the tile) — we cannot
+// prove emptiness and dropping the tile would silently lose valid data.
+//
+// `band_is_empty` lets callers cull bands that are known fully-nodata at
+// bind time (valid_percent == 0). Passing an empty vector disables the
+// cull and behaves as before.
+static bool IsTileEmpty(GDALDatasetH ds,
+                         const std::vector<double> &band_nodatas,
+                         const std::vector<bool> &band_has_nodata,
+                         const std::vector<bool> &band_is_empty = {}) {
+    int band_count = GDALGetRasterCount(ds);
+    if (band_count == 0) return false;
 
-    int width = GDALGetRasterXSize(ds);
+    if (static_cast<int>(band_has_nodata.size()) < band_count) return false;
+    for (int i = 0; i < band_count; i++) {
+        if (!band_has_nodata[i]) return false;
+    }
+
+    int width  = GDALGetRasterXSize(ds);
     int height = GDALGetRasterYSize(ds);
-    GDALRasterBandH band = GDALGetRasterBand(ds, 1);
-
-    // Read first band and check if all pixels are nodata
     size_t num_pixels = static_cast<size_t>(width) * height;
-    GDALDataType dt = GDALGetRasterDataType(band);
-    int dt_size = GDALGetDataTypeSizeBytes(dt);
 
-    std::vector<uint8_t> buf(num_pixels * dt_size);
-    CPLErr err = GDALRasterIO(band, GF_Read, 0, 0, width, height,
-                               buf.data(), width, height, dt, 0, 0);
-    if (err != CE_None) return false;
+    std::vector<uint8_t> buf;
+    for (int b = 1; b <= band_count; b++) {
+        if (b - 1 < (int)band_is_empty.size() && band_is_empty[b - 1]) continue;
 
-    bool is_nan_nodata = std::isnan(nodata);
+        GDALRasterBandH band = GDALGetRasterBand(ds, b);
+        GDALDataType dt = GDALGetRasterDataType(band);
+        int dt_size = GDALGetDataTypeSizeBytes(dt);
 
-    for (size_t i = 0; i < num_pixels; i++) {
-        double val = 0;
-        switch (dt) {
-            case GDT_Byte:    val = static_cast<double>(buf[i]); break;
-            case GDT_Int16:   { int16_t v; memcpy(&v, buf.data() + i * 2, 2); val = v; break; }
-            case GDT_UInt16:  { uint16_t v; memcpy(&v, buf.data() + i * 2, 2); val = v; break; }
-            case GDT_Int32:   { int32_t v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
-            case GDT_UInt32:  { uint32_t v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
-            case GDT_Float32: { float v; memcpy(&v, buf.data() + i * 4, 4); val = v; break; }
-            case GDT_Float64: { memcpy(&val, buf.data() + i * 8, 8); break; }
-            default: return false;
-        }
+        double nodata = band_nodatas[b - 1];
+        bool is_nan_nodata = std::isnan(nodata);
 
-        if (is_nan_nodata) {
-            if (!std::isnan(val)) return false;
-        } else {
-            if (val != nodata) return false;
+        buf.assign(num_pixels * dt_size, 0);
+        CPLErr err = GDALRasterIO(band, GF_Read, 0, 0, width, height,
+                                   buf.data(), width, height, dt, 0, 0);
+        if (err != CE_None) return false;
+
+        for (size_t i = 0; i < num_pixels; i++) {
+            double val = 0;
+            if (!DecodePixel(dt, buf.data(), i, val)) return false;
+            bool pixel_is_nodata = is_nan_nodata ? std::isnan(val) : (val == nodata);
+            if (!pixel_is_nodata) return false;
         }
     }
     return true;
@@ -776,6 +1051,59 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
             }
         } else if (kv.first == "approx") {
             bind_data->approx_stats = kv.second.GetValue<bool>();
+        } else if (kv.first == "sparsity_probe") {
+            auto v = StringUtil::Lower(kv.second.GetValue<string>());
+            if      (v == "auto") bind_data->sparsity_probe = SparsityProbe::Auto;
+            else if (v == "on")   bind_data->sparsity_probe = SparsityProbe::On;
+            else if (v == "off")  bind_data->sparsity_probe = SparsityProbe::Off;
+            else throw InvalidInputException(
+                "sparsity_probe must be 'auto', 'on', or 'off'");
+        } else if (kv.first == "sparsity_probe_size") {
+            int n = kv.second.GetValue<int32_t>();
+            if (n < 4) {
+                throw InvalidInputException(
+                    "sparsity_probe_size must be >= 4 (got %d) — anything "
+                    "smaller has too few mask cells to be statistically "
+                    "meaningful", n);
+            }
+            bind_data->sparsity_probe_size = n;
+        } else if (kv.first == "bands") {
+            // 'all' (case-insensitive) or empty → defer to default fill below.
+            // Otherwise: comma-separated list of 1-based source-band indices.
+            auto raw = kv.second.GetValue<string>();
+            auto raw_lower = StringUtil::Lower(raw);
+            auto first = raw_lower.find_first_not_of(" \t");
+            auto last  = raw_lower.find_last_not_of(" \t");
+            if (first != std::string::npos) {
+                raw_lower = raw_lower.substr(first, last - first + 1);
+            } else {
+                raw_lower.clear();
+            }
+            bind_data->selected_bands.clear();
+            if (raw_lower != "all" && !raw_lower.empty()) {
+                std::stringstream ss(raw);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    auto a = tok.find_first_not_of(" \t");
+                    auto b = tok.find_last_not_of(" \t");
+                    if (a == std::string::npos) continue;
+                    tok = tok.substr(a, b - a + 1);
+                    if (tok.empty()) continue;
+                    try {
+                        bind_data->selected_bands.push_back(std::stoi(tok));
+                    } catch (...) {
+                        throw InvalidInputException(
+                            "bands: invalid band index '%s' "
+                            "(use 'all' or a comma-separated list of 1-based indices)",
+                            tok);
+                    }
+                }
+                if (bind_data->selected_bands.empty()) {
+                    throw InvalidInputException(
+                        "bands: parsed no indices from '%s' "
+                        "(use 'all' or e.g. '1,2,5')", raw);
+                }
+            }
         }
     }
 
@@ -805,13 +1133,51 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         throw InvalidInputException("Raster file has no bands: %s", bind_data->filename);
     }
 
+    // Cap sparsity_probe_size at block_size — anything finer than the
+    // destination tile size is meaningless (the probe is checking whether
+    // a future destination tile would be empty; sub-tile resolution gives
+    // no extra signal).
+    if (bind_data->sparsity_probe_size > bind_data->block_size) {
+        bind_data->sparsity_probe_size = bind_data->block_size;
+    }
+
+    // Resolve `bands` filter: if the user didn't specify (or passed 'all'),
+    // populate selected_bands with 1..raster_band_count. Otherwise validate
+    // the user-supplied indices are in range and dedup while preserving
+    // their order (so bands='5,2' yields band_1=src5, band_2=src2).
+    if (bind_data->selected_bands.empty()) {
+        bind_data->selected_bands.reserve(bind_data->raster_band_count);
+        for (int i = 1; i <= bind_data->raster_band_count; i++) {
+            bind_data->selected_bands.push_back(i);
+        }
+    } else {
+        for (int b : bind_data->selected_bands) {
+            if (b < 1 || b > bind_data->raster_band_count) {
+                GDALClose(ds);
+                throw InvalidInputException(
+                    "bands: index %d out of range (1..%d)",
+                    b, bind_data->raster_band_count);
+            }
+        }
+        std::vector<int> dedup;
+        std::set<int> seen;
+        for (int b : bind_data->selected_bands) {
+            if (seen.insert(b).second) dedup.push_back(b);
+        }
+        bind_data->selected_bands = std::move(dedup);
+    }
+
     GDALRasterBandH first_band = GDALGetRasterBand(ds, 1);
     bind_data->gdal_dtype = GDALGetRasterDataType(first_band);
     bind_data->raquet_dtype = GDALTypeToRaquetType(bind_data->gdal_dtype);
     bind_data->dtype_bytes = GDALTypeSize(bind_data->gdal_dtype);
 
-    // Per-band metadata
-    for (int b = 1; b <= bind_data->raster_band_count; b++) {
+    // Per-band metadata, indexed by output position (0-based dense). Each
+    // entry pulls from the source band at selected_bands[idx]. After this
+    // loop, all the band_* vectors have selected_bands.size() entries and
+    // downstream code iterates them without caring about source indices.
+    for (size_t idx = 0; idx < bind_data->selected_bands.size(); idx++) {
+        int b = bind_data->selected_bands[idx];  // 1-based source index
         GDALRasterBandH band = GDALGetRasterBand(ds, b);
         int has_nd = 0;
         double nd = GDALGetRasterNoDataValue(band, &has_nd);
@@ -886,6 +1252,38 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         bind_data->band_stats.push_back(st);
     }
 
+    // Resolve the sparsity-probe gate. Auto enables the IO probe when at
+    // least one band has bind-time stats and max(valid_percent) is below
+    // the cutoff; otherwise the probe is off. On/Off honor the user's
+    // choice directly. band_is_empty is populated unconditionally so the
+    // per-band cull in IsTileEmpty can run regardless of probe state.
+    {
+        constexpr double SPARSITY_AUTO_VALID_PCT_CUTOFF = 95.0;
+        // Iterate selected (output) bands; band_stats has selected.size()
+        // entries indexed by output position.
+        const int out_band_count = static_cast<int>(bind_data->selected_bands.size());
+        bind_data->band_is_empty.assign(out_band_count, false);
+        double max_valid_pct = -1.0;
+        for (int i = 0; i < out_band_count; i++) {
+            const auto &st = bind_data->band_stats[i];
+            if (!st.has_stats) continue;
+            if (st.valid_percent <= 0.0) bind_data->band_is_empty[i] = true;
+            max_valid_pct = std::max(max_valid_pct, st.valid_percent);
+        }
+        switch (bind_data->sparsity_probe) {
+            case SparsityProbe::On:
+                bind_data->sparsity_probe_active = true;
+                break;
+            case SparsityProbe::Off:
+                bind_data->sparsity_probe_active = false;
+                break;
+            case SparsityProbe::Auto:
+                bind_data->sparsity_probe_active =
+                    (max_valid_pct >= 0.0 && max_valid_pct < SPARSITY_AUTO_VALID_PCT_CUTOFF);
+                break;
+        }
+    }
+
     // CF time dimension extraction (NetCDF)
     {
         char **md = GDALGetMetadata(ds, nullptr);
@@ -935,6 +1333,20 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
                 }
             }
         }
+    }
+
+    // Disallow band filtering on time-series sources. CF-time mode emits
+    // one row per band per tile and uses cf_time_values[band_idx] as the
+    // time value — filtering bands would silently reorder/drop time
+    // dimensions. Out of scope for this feature; raise an explicit error.
+    if (bind_data->has_cf_time &&
+        static_cast<int>(bind_data->selected_bands.size()) !=
+            bind_data->raster_band_count) {
+        GDALClose(ds);
+        throw InvalidInputException(
+            "bands filter is not supported on time-series rasters "
+            "(CF time dimension detected); convert all bands or strip "
+            "the time dimension upstream");
     }
 
     // CRS detection
@@ -1065,12 +1477,16 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
     names.push_back("metadata");
     return_types.push_back(LogicalType::VARCHAR);
 
-    // Band columns
+    // Band columns. Schema follows raster_loader convention: dense
+    // band_1..band_N where N is the number of selected bands. Source-band
+    // indices are not visible in column names; they're preserved in the
+    // metadata JSON (bands[i].source_band) for downstream tools.
+    const int out_band_count = static_cast<int>(bind_data->selected_bands.size());
     if (bind_data->band_layout == "interleaved") {
         names.push_back("pixels");
         return_types.push_back(LogicalType::BLOB);
     } else {
-        for (int b = 0; b < bind_data->raster_band_count; b++) {
+        for (int b = 0; b < out_band_count; b++) {
             names.push_back("band_" + std::to_string(b + 1));
             return_types.push_back(LogicalType::BLOB);
         }
@@ -1078,7 +1494,7 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
 
     // Statistics columns (optional)
     if (bind_data->statistics) {
-        for (int b = 0; b < bind_data->raster_band_count; b++) {
+        for (int b = 0; b < out_band_count; b++) {
             std::string prefix = "band_" + std::to_string(b + 1) + "_";
             names.push_back(prefix + "count");  return_types.push_back(LogicalType::BIGINT);
             names.push_back(prefix + "min");    return_types.push_back(LogicalType::DOUBLE);
@@ -1121,6 +1537,7 @@ static unique_ptr<GlobalTableFunctionState> ReadRasterInitGlobal(ClientContext &
                                                                   TableFunctionInitInput &input) {
     auto &bind_data = input.bind_data->Cast<ReadRasterBindData>();
     auto state = make_uniq<ReadRasterGlobalState>();
+    state->init_start = std::chrono::steady_clock::now();
 
     state->source_resampling = bind_data.resampling;
     state->has_overviews = (bind_data.min_zoom < bind_data.max_zoom);
@@ -1256,31 +1673,74 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             my_idx = state.next_tile_idx++;
         }
 
+        // [phase-timing] mark the first Phase 1 tile pull
+        if (state.phase1_first_ns.load(std::memory_order_acquire) < 0) {
+            int64_t expected = -1;
+            int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - state.init_start).count();
+            if (state.phase1_first_ns.compare_exchange_strong(expected, now_ns)) {
+                if (DebugTimingEnabled()) {
+                    fprintf(stderr, "[raquet-phase] phase1_first @ %.3fs (native_tiles=%zu, threads=%d)\n",
+                            now_ns / 1e9, state.native_tiles.size(),
+                            static_cast<int>(state.MaxThreads()));
+                    fflush(stderr);
+                }
+            }
+        }
+
         auto &tile = state.native_tiles[my_idx];
 
-        // Create tile dataset and warp
+        // Create tile dataset and warp. Destination band count is the
+        // selected-band count (the band filter), not the source's raw
+        // raster_band_count.
         std::string tile_path;
         GDALDatasetH tile_ds = CreateTileDataset(
             local.gtiff_driver, local.web_mercator_wkt,
             tile, bind_data.block_size,
-            bind_data.raster_band_count, bind_data.gdal_dtype,
+            static_cast<int>(bind_data.selected_bands.size()), bind_data.gdal_dtype,
             state.nodata_value, state.has_nodata, tile_path);
 
-        WarpIntoTile(local, tile_ds, state.source_resampling,
-                     state.nodata_value, state.has_nodata);
+        // Pre-warp emptiness checks: build the transformer first so both
+        // the geometric pre-check and the IO probe can use it. The geometric
+        // check is free (no IO) and runs whenever sparsity_probe != Off.
+        // The IO probe is gated by sparsity_probe_active (resolved at bind
+        // time from sparsity_probe + valid_percent stats).
+        bool pre_warp_skip = false;
+        if (bind_data.sparsity_probe != SparsityProbe::Off) {
+            EnsureWarpTransformer(local, tile_ds, /*overview_level=*/-1);
+            pre_warp_skip = IsTileOutsideSource(local.src_ds, local.warp_transformer,
+                                                 bind_data.block_size);
+            if (!pre_warp_skip && bind_data.sparsity_probe_active) {
+                pre_warp_skip = IsSourceWindowEmpty(
+                    local.src_ds, local.warp_transformer,
+                    bind_data.block_size,
+                    bind_data.band_nodatas, bind_data.band_has_nodata,
+                    bind_data.band_is_empty,
+                    bind_data.selected_bands,
+                    bind_data.sparsity_probe_size);
+            }
+        }
 
-        bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
+        if (!pre_warp_skip) {
+            WarpIntoTile(local, tile_ds, state.source_resampling,
+                         state.nodata_value, state.has_nodata,
+                         bind_data.selected_bands);
 
-        if (!empty) {
-            auto tile_data = ReadAndCompressBands(
-                tile_ds, bind_data.compression, bind_data.compression_quality,
-                bind_data.band_layout, bind_data.statistics,
-                bind_data.raquet_dtype, state.has_nodata, state.nodata_value);
+            bool empty = IsTileEmpty(tile_ds, bind_data.band_nodatas,
+                                     bind_data.band_has_nodata,
+                                     bind_data.band_is_empty);
 
-            uint64_t block = quadbin::tile_to_cell(tile.x, tile.y, tile.z);
-            EmitTileRow(output, row_count, bind_data, block, tile_data);
-            state.total_blocks++;
-            row_count++;
+            if (!empty) {
+                auto tile_data = ReadAndCompressBands(
+                    tile_ds, bind_data.compression, bind_data.compression_quality,
+                    bind_data.band_layout, bind_data.statistics,
+                    bind_data.raquet_dtype, state.has_nodata, state.nodata_value);
+
+                uint64_t block = quadbin::tile_to_cell(tile.x, tile.y, tile.z);
+                EmitTileRow(output, row_count, bind_data, block, tile_data);
+                state.total_blocks++;
+                row_count++;
+            }
         }
 
         GDALClose(tile_ds);
@@ -1334,6 +1794,24 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                 } else {
                     state.overview_results.reserve(state.overview_frames.size());
                 }
+                {
+                    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - state.init_start).count();
+                    state.phase1_done_ns.store(now_ns, std::memory_order_release);
+                    state.phase2_init_ns.store(now_ns, std::memory_order_release);
+                    if (DebugTimingEnabled()) {
+                        int64_t p1_first = state.phase1_first_ns.load(std::memory_order_acquire);
+                        fprintf(stderr,
+                            "[raquet-phase] phase1_done @ %.3fs (phase1_wall=%.3fs, "
+                            "native_tiles=%zu, emitted=%d, overview_frames=%zu)\n",
+                            now_ns / 1e9,
+                            (now_ns - p1_first) / 1e9,
+                            state.native_tiles.size(),
+                            state.total_blocks.load(),
+                            state.overview_frames.size());
+                        fflush(stderr);
+                    }
+                }
                 state.phase2_init_done.store(true, std::memory_order_release);
                 // Wake siblings waiting on phase2_init_done, plus any thread
                 // already past staging that's parked on phase2_staged (the
@@ -1365,17 +1843,13 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             GDALDatasetH tile_ds = CreateTileDataset(
                 local.gtiff_driver, local.web_mercator_wkt,
                 frame.tile, bind_data.block_size,
-                bind_data.raster_band_count, bind_data.gdal_dtype,
+                static_cast<int>(bind_data.selected_bands.size()), bind_data.gdal_dtype,
                 state.nodata_value, state.has_nodata, ovr_path);
 
-            // Try COG overview fast path: read directly from a source overview
-            // level with a matching reduction factor instead of re-warping
-            // from the base resolution. Geometrically valid for any source
-            // CRS — the destination tile is in Web Mercator regardless of
-            // source, and the warper reprojects from the chosen overview just
-            // as it would from the base. The tolerance check on the reduction
-            // factor is what validates suitability.
-            bool used_cog = false;
+            // Decide the source overview level upfront so the pre-warp
+            // probe and the warp itself share one transformer. -1 means
+            // "warp from base resolution" (no COG fast path).
+            int chosen_overview = -1;
             if (bind_data.overview_count > 0) {
                 int zoom_diff = bind_data.max_zoom - frame.tile.z;
                 int reduction_factor = 1 << zoom_diff;
@@ -1387,41 +1861,68 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                         int ovr_xsize = GDALGetRasterBandXSize(ovr);
                         double ovr_reduction = static_cast<double>(src_xsize) / ovr_xsize;
                         if (std::abs(ovr_reduction - reduction_factor) / reduction_factor < 0.1) {
-                            WarpIntoTile(local, tile_ds, GRA_NearestNeighbour,
-                                         state.nodata_value, state.has_nodata, i);
-                            used_cog = true;
+                            chosen_overview = i;
                             break;
                         }
                     }
                 }
             }
 
-            if (!used_cog) {
-                // Fallback: warp from base resolution. Honour the user's
-                // resampling= named param (default GRA_NearestNeighbour) so
-                // Phase 2 fallback is consistent with Phase 1. Hardcoding
-                // GRA_Average here was wrong for categorical/palette bands —
-                // averaging neighbouring class IDs invents values that don't
-                // exist in the source (e.g. avg(10,20)=15 for a discrete
-                // class raster).
-                WarpIntoTile(local, tile_ds, state.source_resampling,
-                             state.nodata_value, state.has_nodata);
+            // Pre-warp emptiness checks (same logic as Phase 1, sharing the
+            // transformer at chosen_overview). The IO probe at sub-resolution
+            // implicitly uses the cheapest GDAL overview anyway.
+            bool pre_warp_skip = false;
+            if (bind_data.sparsity_probe != SparsityProbe::Off) {
+                EnsureWarpTransformer(local, tile_ds, chosen_overview);
+                pre_warp_skip = IsTileOutsideSource(local.src_ds, local.warp_transformer,
+                                                     bind_data.block_size);
+                if (!pre_warp_skip && bind_data.sparsity_probe_active) {
+                    pre_warp_skip = IsSourceWindowEmpty(
+                        local.src_ds, local.warp_transformer,
+                        bind_data.block_size,
+                        bind_data.band_nodatas, bind_data.band_has_nodata,
+                        bind_data.band_is_empty,
+                        bind_data.selected_bands,
+                        bind_data.sparsity_probe_size);
+                }
             }
 
-            bool empty = IsTileEmpty(tile_ds, state.nodata_value, state.has_nodata);
-
-            if (!empty) {
-                auto tile_data = ReadAndCompressBands(
-                    tile_ds, bind_data.compression, bind_data.compression_quality,
-                    bind_data.band_layout, bind_data.statistics,
-                    bind_data.raquet_dtype, state.has_nodata, state.nodata_value);
-
-                uint64_t block = quadbin::tile_to_cell(frame.tile.x, frame.tile.y, frame.tile.z);
-                {
-                    std::lock_guard<std::mutex> lock(state.overview_results_mutex);
-                    state.overview_results.push_back({block, std::move(tile_data)});
+            if (!pre_warp_skip) {
+                if (chosen_overview >= 0) {
+                    // COG fast path: read directly from the matching source
+                    // overview. Geometrically valid for any source CRS —
+                    // the destination tile is in Web Mercator regardless,
+                    // and the warper reprojects from the chosen overview
+                    // just as it would from base.
+                    WarpIntoTile(local, tile_ds, GRA_NearestNeighbour,
+                                 state.nodata_value, state.has_nodata,
+                                 bind_data.selected_bands, chosen_overview);
+                } else {
+                    // Fallback: warp from base resolution. Honour the user's
+                    // resampling= named param (default GRA_NearestNeighbour)
+                    // so Phase 2 fallback is consistent with Phase 1.
+                    WarpIntoTile(local, tile_ds, state.source_resampling,
+                                 state.nodata_value, state.has_nodata,
+                                 bind_data.selected_bands);
                 }
-                state.total_blocks++;
+
+                bool empty = IsTileEmpty(tile_ds, bind_data.band_nodatas,
+                                         bind_data.band_has_nodata,
+                                         bind_data.band_is_empty);
+
+                if (!empty) {
+                    auto tile_data = ReadAndCompressBands(
+                        tile_ds, bind_data.compression, bind_data.compression_quality,
+                        bind_data.band_layout, bind_data.statistics,
+                        bind_data.raquet_dtype, state.has_nodata, state.nodata_value);
+
+                    uint64_t block = quadbin::tile_to_cell(frame.tile.x, frame.tile.y, frame.tile.z);
+                    {
+                        std::lock_guard<std::mutex> lock(state.overview_results_mutex);
+                        state.overview_results.push_back({block, std::move(tile_data)});
+                    }
+                    state.total_blocks++;
+                }
             }
 
             GDALClose(tile_ds);
@@ -1431,6 +1932,23 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             if (completed >= total_frames) {
                 // We finished the last overview tile — publish the staged
                 // queue and wake any post-staging waiter parked on wait_cv.
+                {
+                    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - state.init_start).count();
+                    state.phase2_staged_ns.store(now_ns, std::memory_order_release);
+                    if (DebugTimingEnabled()) {
+                        int64_t p2_init = state.phase2_init_ns.load(std::memory_order_acquire);
+                        fprintf(stderr,
+                            "[raquet-phase] phase2_staged @ %.3fs (phase2_wall=%.3fs, "
+                            "overview_frames=%zu, staged=%zu, total_blocks=%d)\n",
+                            now_ns / 1e9,
+                            (now_ns - p2_init) / 1e9,
+                            total_frames,
+                            state.overview_results.size(),
+                            state.total_blocks.load());
+                        fflush(stderr);
+                    }
+                }
                 state.phase2_staged.store(true, std::memory_order_release);
                 { std::lock_guard<std::mutex> lk(state.wait_mutex); }
                 state.wait_cv.notify_all();
@@ -1486,6 +2004,21 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
     // ── Phase 3: Emit metadata row (exactly once, thread-safe) ──
     bool expected = false;
     if (state.metadata_emitted.compare_exchange_strong(expected, true)) {
+        {
+            int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - state.init_start).count();
+            state.phase3_done_ns.store(now_ns, std::memory_order_release);
+            if (DebugTimingEnabled()) {
+                int64_t p2_staged = state.phase2_staged_ns.load(std::memory_order_acquire);
+                fprintf(stderr,
+                    "[raquet-phase] phase3_metadata @ %.3fs (drain+meta_wall=%.3fs, "
+                    "total_blocks=%d)\n",
+                    now_ns / 1e9,
+                    (now_ns - p2_staged) / 1e9,
+                    state.total_blocks.load());
+                fflush(stderr);
+            }
+        }
         // Build metadata
         raquet::RaquetMetadata meta;
         meta.file_format = "raquet";
@@ -1521,11 +2054,16 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             meta.time_calendar = bind_data.cf_calendar;
         }
 
-        // Band info with extended metadata
-        for (int b = 0; b < bind_data.raster_band_count; b++) {
+        // Band info with extended metadata. Indexed by output (selected)
+        // band position; the source-band index for each entry is preserved
+        // in BandInfo.source_band so downstream tools can map output
+        // band_N back to its source.
+        const int out_band_count = static_cast<int>(bind_data.selected_bands.size());
+        for (int b = 0; b < out_band_count; b++) {
             raquet::BandInfo bi;
             bi.name = "band_" + std::to_string(b + 1);
             bi.type = bind_data.raquet_dtype;
+            bi.source_band = bind_data.selected_bands[b];
             if (bind_data.band_has_nodata[b]) {
                 bi.nodata = bind_data.band_nodatas[b];
                 bi.has_nodata = true;
@@ -1571,7 +2109,9 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         col++;
 
         // Band columns are NULL for metadata row
-        int num_band_cols = (bind_data.band_layout == "interleaved") ? 1 : bind_data.raster_band_count;
+        int num_band_cols = (bind_data.band_layout == "interleaved")
+                                ? 1
+                                : static_cast<int>(bind_data.selected_bands.size());
         for (int b = 0; b < num_band_cols; b++) {
             FlatVector::SetNull(output.data[col], row_count, true);
             col++;
@@ -1579,7 +2119,8 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
 
         // Stats columns are NULL for metadata row
         if (bind_data.statistics) {
-            for (int b = 0; b < bind_data.raster_band_count * 6; b++) {
+            int stats_cols = static_cast<int>(bind_data.selected_bands.size()) * 6;
+            for (int b = 0; b < stats_cols; b++) {
                 FlatVector::SetNull(output.data[col], row_count, true);
                 col++;
             }
@@ -1620,6 +2161,9 @@ void RegisterReadRaster(ExtensionLoader &loader) {
     func.named_parameters["zoom_strategy"] = LogicalType::VARCHAR;
     func.named_parameters["format"] = LogicalType::VARCHAR;
     func.named_parameters["approx"] = LogicalType::BOOLEAN;
+    func.named_parameters["sparsity_probe"] = LogicalType::VARCHAR;
+    func.named_parameters["sparsity_probe_size"] = LogicalType::INTEGER;
+    func.named_parameters["bands"] = LogicalType::VARCHAR;
     func.cardinality = ReadRasterCardinality;
 
     loader.RegisterFunction(func);
