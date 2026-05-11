@@ -1,0 +1,171 @@
+# name: test/sql/st_raster_macro.test
+# description: ST_Raster / ST_RasterAt table macros — the query_table() codepath
+#              (distinct from read_raquet / read_raquet_at which use
+#              read_parquet). Covers all overloads, the block != 0 metadata
+#              propagation, and the block::UBIGINT cast for iceberg-style
+#              tables that store block as BIGINT.
+# group: [raquet]
+
+require raquet
+
+require parquet
+
+# =============================================================================
+# Setup: load the committed sample fixture into a regular table so ST_Raster's
+# query_table('name') resolution can find it.
+#   Fixture facts: 1 metadata row + 2 data tiles, zoom 10, centred near
+#   (lon=13.008, lat=52.492) per the metadata bounds/center fields.
+# =============================================================================
+
+statement ok
+CREATE TABLE strast AS SELECT * FROM read_parquet('test/data/raquet_test.parquet');
+
+# =============================================================================
+# ST_Raster(tbl): 1-arg overload returns only data rows (block != 0).
+# Metadata column is propagated from the block=0 row.
+# =============================================================================
+
+query I
+SELECT count(*) FROM ST_Raster('strast');
+----
+2
+
+# Every returned row carries the metadata column non-null
+query I
+SELECT count(*) FROM ST_Raster('strast') WHERE metadata IS NOT NULL;
+----
+2
+
+# All returned blocks are at zoom 10
+query I
+SELECT count(DISTINCT quadbin_resolution(block)) FROM ST_Raster('strast');
+----
+1
+
+query I
+SELECT DISTINCT quadbin_resolution(block) FROM ST_Raster('strast');
+----
+10
+
+# =============================================================================
+# ST_Raster(tbl, geometry): spatial filter at the file's max_zoom. A polygon
+# covering the data's neighbourhood matches all 2 tiles; a polygon far away
+# matches none.
+# =============================================================================
+
+query I
+SELECT count(*) FROM ST_Raster(
+    'strast',
+    'POLYGON((12.9 52.4, 13.1 52.4, 13.1 52.6, 12.9 52.6, 12.9 52.4))'::GEOMETRY
+);
+----
+2
+
+query I
+SELECT count(*) FROM ST_Raster(
+    'strast',
+    'POLYGON((-50 -50, -49 -50, -49 -49, -50 -49, -50 -50))'::GEOMETRY
+);
+----
+0
+
+# =============================================================================
+# ST_Raster(tbl, geometry, resolution): explicit resolution must match the
+# file's tile resolution (10) for hits.
+# =============================================================================
+
+query I
+SELECT count(*) FROM ST_Raster(
+    'strast',
+    'POLYGON((12.9 52.4, 13.1 52.4, 13.1 52.6, 12.9 52.6, 12.9 52.4))'::GEOMETRY,
+    10
+);
+----
+2
+
+# At a non-matching resolution there are no rows (no block at zoom 5 in the file).
+query I
+SELECT count(*) FROM ST_Raster(
+    'strast',
+    'POLYGON((12.9 52.4, 13.1 52.4, 13.1 52.6, 12.9 52.6, 12.9 52.4))'::GEOMETRY,
+    5
+);
+----
+0
+
+# =============================================================================
+# ST_RasterAt(tbl, point): point query via GEOMETRY input — uses the auto-
+# detected max_zoom (10) from the metadata.
+# =============================================================================
+
+query I
+SELECT count(*) FROM ST_RasterAt('strast', ST_Point(13.008, 52.492));
+----
+1
+
+# The block we get matches a freshly-computed quadbin for the same point/zoom.
+query I
+SELECT block = quadbin_from_lonlat(13.008, 52.492, 10) FROM ST_RasterAt('strast', ST_Point(13.008, 52.492));
+----
+true
+
+# =============================================================================
+# ST_RasterAt(tbl, lon, lat): 3-arg form with raw coordinates.
+# =============================================================================
+
+query I
+SELECT count(*) FROM ST_RasterAt('strast', 13.008, 52.492);
+----
+1
+
+query I
+SELECT block = quadbin_from_lonlat(13.008, 52.492, 10) FROM ST_RasterAt('strast', 13.008, 52.492);
+----
+true
+
+# =============================================================================
+# ST_RasterAt(tbl, lon, lat, resolution): 4-arg form with explicit resolution.
+# =============================================================================
+
+query I
+SELECT count(*) FROM ST_RasterAt('strast', 13.008, 52.492, 10);
+----
+1
+
+# A point clearly outside the covered tiles yields 0 rows.
+query I
+SELECT count(*) FROM ST_RasterAt('strast', -50.0, -50.0, 10);
+----
+0
+
+# =============================================================================
+# Iceberg-style storage: block stored as BIGINT (signed) instead of UBIGINT
+# must still work — the macros cast via `block::UBIGINT`. This is the gotcha
+# called out in CLAUDE.md.
+# =============================================================================
+
+statement ok
+CREATE TABLE strast_bigint AS
+SELECT block::BIGINT AS block, metadata, band_1
+FROM read_parquet('test/data/raquet_test.parquet');
+
+# 1-arg (no cast in macro): block != 0 still works on BIGINT
+query I
+SELECT count(*) FROM ST_Raster('strast_bigint');
+----
+2
+
+# 2-arg uses block::UBIGINT — proves the cast handles BIGINT input
+query I
+SELECT count(*) FROM ST_Raster(
+    'strast_bigint',
+    'POLYGON((12.9 52.4, 13.1 52.4, 13.1 52.6, 12.9 52.6, 12.9 52.4))'::GEOMETRY
+);
+----
+2
+
+# 4-arg ST_RasterAt also exercises the cast
+query I
+SELECT count(*) FROM ST_RasterAt('strast_bigint', 13.008, 52.492, 10);
+----
+1

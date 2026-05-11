@@ -1,0 +1,158 @@
+# name: test/sql/clip.test
+# description: ST_Clip (4-arg + 5-arg w/ nodata) and ST_ClipMask — pixel-by-pixel
+#              geometry filtering against a small synthetic 4×4 uint8 tile placed
+#              at the world tile (0,0,0). Pixel-center math is exercised through
+#              hand-verified WGS84 coordinates.
+# group: [raquet]
+
+require raquet
+
+# =============================================================================
+# Setup: 4×4 uint8 tile with row-major values 1..16 at world tile (0,0,0).
+# Pixel-center coords (deg, WGS84) — recall row 0 is NORTH (max lat) and the
+# function uses pixel-center for inside/outside tests:
+#   col 0,1,2,3   →  lon -135, -45,  45, 135
+#   row 0,1,2,3   →  lat  63.79,  21.26, -21.26, -63.79
+# Tile bbox is (-180, -85.0511) → (180, 85.0511).
+# =============================================================================
+
+statement ok
+CREATE TABLE clip_tile AS
+SELECT
+    quadbin_from_tile(0, 0, 0)::UBIGINT AS block,
+    '\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10'::BLOB AS band_1,
+    '{"compression":"none","tiling":{"block_width":4,"block_height":4},"bands":[{"name":"band_1","type":"uint8"}]}' AS metadata;
+
+# =============================================================================
+# ST_Clip: polygon covering the whole world keeps every pixel (1..16, in order)
+# =============================================================================
+
+query I
+SELECT ST_Clip(
+    band_1, block,
+    'POLYGON((-180 -85, 180 -85, 180 85, -180 85, -180 -85))'::GEOMETRY,
+    metadata
+) FROM clip_tile;
+----
+[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
+
+# =============================================================================
+# ST_Clip: NW-quadrant polygon (-180,0)-(0,85) keeps only pixels at cols 0-1,
+# rows 0-1 → values 1, 2 (row 0) and 5, 6 (row 1), in that scan order.
+# =============================================================================
+
+query I
+SELECT ST_Clip(
+    band_1, block,
+    'POLYGON((-180 0, 0 0, 0 85, -180 85, -180 0))'::GEOMETRY,
+    metadata
+) FROM clip_tile;
+----
+[1.0, 2.0, 5.0, 6.0]
+
+# =============================================================================
+# ST_Clip: polygon disjoint from any pixel center (a 10°×10° box over Indonesia,
+# centred at lon=105, lat=0 — no pixel center falls there) → empty list, not NULL.
+# =============================================================================
+
+query II
+SELECT ST_Clip(
+    band_1, block,
+    'POLYGON((100 -10, 110 -10, 110 10, 100 10, 100 -10))'::GEOMETRY,
+    metadata
+), len(ST_Clip(
+    band_1, block,
+    'POLYGON((100 -10, 110 -10, 110 10, 100 10, 100 -10))'::GEOMETRY,
+    metadata
+))
+FROM clip_tile;
+----
+[]	0
+
+# =============================================================================
+# ST_Clip with nodata: same NW quadrant, nodata=2.0 drops the value 2.
+# Remaining: 1, 5, 6.
+# =============================================================================
+
+query I
+SELECT ST_Clip(
+    band_1, block,
+    'POLYGON((-180 0, 0 0, 0 85, -180 85, -180 0))'::GEOMETRY,
+    metadata,
+    2.0
+) FROM clip_tile;
+----
+[1.0, 5.0, 6.0]
+
+# =============================================================================
+# ST_ClipMask: NW-quadrant polygon with nodata=99 → 16 values total, kept
+# pixels at indices 0,1,4,5 (cols 0-1 of rows 0-1 in row-major order); the
+# other 12 positions carry 99.
+# =============================================================================
+
+query II
+SELECT len(ST_ClipMask(
+    band_1, block,
+    'POLYGON((-180 0, 0 0, 0 85, -180 85, -180 0))'::GEOMETRY,
+    metadata,
+    99.0
+)), list_aggregate(ST_ClipMask(
+    band_1, block,
+    'POLYGON((-180 0, 0 0, 0 85, -180 85, -180 0))'::GEOMETRY,
+    metadata,
+    99.0
+), 'sum')
+FROM clip_tile;
+----
+16	1202.0
+
+# Verify the exact ordered output to lock the row-major contract.
+query I
+SELECT ST_ClipMask(
+    band_1, block,
+    'POLYGON((-180 0, 0 0, 0 85, -180 85, -180 0))'::GEOMETRY,
+    metadata,
+    99.0
+) FROM clip_tile;
+----
+[1.0, 2.0, 99.0, 99.0, 5.0, 6.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0]
+
+# =============================================================================
+# ST_ClipMask: tile fully outside the clip geometry returns the same dimensions
+# but every pixel is nodata. The 10°×10° box over Indonesia is disjoint from
+# every pixel center (see earlier ST_Clip test).
+# =============================================================================
+
+query II
+SELECT len(ST_ClipMask(
+    band_1, block,
+    'POLYGON((100 -10, 110 -10, 110 10, 100 10, 100 -10))'::GEOMETRY,
+    metadata,
+    -1.0
+)), list_aggregate(ST_ClipMask(
+    band_1, block,
+    'POLYGON((100 -10, 110 -10, 110 10, 100 10, 100 -10))'::GEOMETRY,
+    metadata,
+    -1.0
+), 'sum')
+FROM clip_tile;
+----
+16	-16.0
+
+# =============================================================================
+# Bad metadata → ClipMetadata::Parse throws but ST_Clip catches the exception
+# and surfaces NULL (sets validity invalid), it does NOT propagate to SQL.
+# Documenting that contract here so a future change can't silently regress it.
+# =============================================================================
+
+query I
+SELECT ST_Clip(band_1, block, 'POLYGON((-180 0, 0 0, 0 85, -180 85, -180 0))'::GEOMETRY, 'not-json') IS NULL
+FROM clip_tile;
+----
+true
+
+query I
+SELECT ST_Clip(band_1, block, 'POLYGON((-180 0, 0 0, 0 85, -180 85, -180 0))'::GEOMETRY, '[1,2,3]') IS NULL
+FROM clip_tile;
+----
+true

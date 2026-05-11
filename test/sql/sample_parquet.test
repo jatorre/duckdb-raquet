@@ -1,0 +1,94 @@
+# name: test/sql/sample_parquet.test
+# description: Smoke-test the committed sample fixture (test/data/raquet_test.parquet).
+#              Mirrors the queries previously run only by the CI YAML so the
+#              gzip-compressed 256×256 tile path is also exercised by `make test`.
+#              Uses raquet_parse_metadata to inspect the metadata column without
+#              requiring the json extension.
+# group: [raquet]
+
+require raquet
+
+require parquet
+
+# =============================================================================
+# Total row count: 1 metadata row (block=0) + 2 data tiles at zoom 10
+# =============================================================================
+
+query I
+SELECT count(*) FROM read_parquet('test/data/raquet_test.parquet');
+----
+3
+
+# =============================================================================
+# Metadata row: compression, block dimensions, zoom range, band count
+# =============================================================================
+
+query IIIII
+SELECT (raquet_parse_metadata(metadata)).compression,
+       (raquet_parse_metadata(metadata)).block_width,
+       (raquet_parse_metadata(metadata)).block_height,
+       (raquet_parse_metadata(metadata)).max_zoom,
+       (raquet_parse_metadata(metadata)).num_bands
+FROM read_parquet('test/data/raquet_test.parquet')
+WHERE block = 0;
+----
+gzip	256	256	10	1
+
+# =============================================================================
+# Data tiles: exactly 2, both at zoom 10
+# =============================================================================
+
+query I
+SELECT count(*) FROM read_parquet('test/data/raquet_test.parquet') WHERE block != 0;
+----
+2
+
+query I
+SELECT count(DISTINCT quadbin_resolution(block))
+FROM read_parquet('test/data/raquet_test.parquet')
+WHERE block != 0;
+----
+1
+
+query I
+SELECT DISTINCT quadbin_resolution(block)
+FROM read_parquet('test/data/raquet_test.parquet')
+WHERE block != 0;
+----
+10
+
+# =============================================================================
+# Tile bounding boxes: every data tile must have min<max on both axes
+# =============================================================================
+
+query I
+SELECT count(*)
+FROM read_parquet('test/data/raquet_test.parquet')
+WHERE block != 0
+  AND (quadbin_to_bbox(block)).min_lon < (quadbin_to_bbox(block)).max_lon
+  AND (quadbin_to_bbox(block)).min_lat < (quadbin_to_bbox(block)).max_lat;
+----
+2
+
+# =============================================================================
+# Pixel extraction at the centre of every tile must succeed (no errors) and
+# return a finite uint8 value in [0, 255]. The fixture is gzip-compressed, so
+# this exercises the gzip decoder on a realistic 256×256 tile.
+# =============================================================================
+
+query I
+SELECT count(*)
+FROM read_parquet('test/data/raquet_test.parquet')
+WHERE block != 0
+  AND raquet_pixel(band_1, 'uint8', 128, 128, 256, 'gzip') BETWEEN 0 AND 255;
+----
+2
+
+# =============================================================================
+# read_raquet() macro should also accept the fixture and surface the data rows.
+# =============================================================================
+
+query I
+SELECT count(*) FROM read_raquet('test/data/raquet_test.parquet');
+----
+2

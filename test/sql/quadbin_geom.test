@@ -1,0 +1,133 @@
+# name: test/sql/quadbin_geom.test
+# description: ST_GeomFromQuadbin(cell) and ST_Contains(geom, block) — the
+#              quadbin↔GEOMETRY bridge functions. Verifies that the geometry
+#              produced by ST_GeomFromQuadbin behaves like the tile's polygon
+#              (downstream containment / intersection), and that ST_Contains
+#              follows PostGIS container/contained ordering.
+#              Uses 'WKT'::GEOMETRY casts (no spatial extension dependency).
+# group: [raquet]
+
+require raquet
+
+# =============================================================================
+# ST_GeomFromQuadbin must return GEOMETRY type for any valid cell.
+# =============================================================================
+
+query I
+SELECT typeof(ST_GeomFromQuadbin(quadbin_from_tile(0, 0, 0)));
+----
+GEOMETRY
+
+query I
+SELECT typeof(ST_GeomFromQuadbin(quadbin_from_tile(4096, 2048, 13)));
+----
+GEOMETRY
+
+# =============================================================================
+# Idempotency: same input cell → same WKB bytes.
+# =============================================================================
+
+query I
+SELECT ST_GeomFromQuadbin(quadbin_from_tile(4096, 2048, 13))
+     = ST_GeomFromQuadbin(quadbin_from_tile(4096, 2048, 13));
+----
+true
+
+# Distinct cells produce distinct geometries (two different zoom-1 tiles).
+query I
+SELECT ST_GeomFromQuadbin(quadbin_from_tile(0, 0, 1))
+     = ST_GeomFromQuadbin(quadbin_from_tile(1, 0, 1));
+----
+false
+
+# =============================================================================
+# The geometry returned by ST_GeomFromQuadbin describes the same tile bbox as
+# the cell itself — ST_Intersects (a separately tested function with its own
+# bbox extractor) must report intersection between the polygon and the cell.
+# =============================================================================
+
+query I
+SELECT ST_Intersects(
+    quadbin_from_tile(0, 0, 0),
+    ST_GeomFromQuadbin(quadbin_from_tile(0, 0, 0))
+);
+----
+true
+
+query I
+SELECT ST_Intersects(
+    quadbin_from_tile(4096, 2048, 13),
+    ST_GeomFromQuadbin(quadbin_from_tile(4096, 2048, 13))
+);
+----
+true
+
+# =============================================================================
+# ST_Contains: a world-spanning polygon must contain every tile at every zoom.
+# =============================================================================
+
+query I
+SELECT ST_Contains(
+    'POLYGON((-180 -86, 180 -86, 180 86, -180 86, -180 -86))'::GEOMETRY,
+    quadbin_from_tile(4096, 2048, 13)
+);
+----
+true
+
+query I
+SELECT ST_Contains(
+    'POLYGON((-180 -86, 180 -86, 180 86, -180 86, -180 -86))'::GEOMETRY,
+    quadbin_from_tile(0, 0, 4)
+);
+----
+true
+
+# =============================================================================
+# ST_Contains: a tiny polygon inside a single tile does NOT contain that tile
+# (PostGIS-style: ALL four corners of the tile must be inside the geometry).
+# =============================================================================
+
+query I
+SELECT ST_Contains(
+    'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'::GEOMETRY,
+    quadbin_from_tile(0, 0, 0)
+);
+----
+false
+
+# =============================================================================
+# ST_Contains: polygon that covers a child tile but not its parent.
+# A z=4 tile at (8, 8) is in the eastern hemisphere — bbox approx
+# (0..22.5, -21.94..0). A generous box covering that area contains the tile.
+# =============================================================================
+
+query I
+SELECT ST_Contains(
+    'POLYGON((-1 -25, 25 -25, 25 1, -1 1, -1 -25))'::GEOMETRY,
+    quadbin_from_tile(8, 8, 4)
+);
+----
+true
+
+# Same polygon vs. the parent tile (4, 4, 3) at z=3 — bbox approx
+# (0..45, -40.98..0). The polygon doesn't reach lon=45, so the SE/NE
+# corners fall outside.
+query I
+SELECT ST_Contains(
+    'POLYGON((-1 -25, 25 -25, 25 1, -1 1, -1 -25))'::GEOMETRY,
+    quadbin_from_tile(4, 4, 3)
+);
+----
+false
+
+# =============================================================================
+# Sanity: a generous polygon obviously contains a small zoom-1 tile.
+# =============================================================================
+
+query I
+SELECT ST_Contains(
+    'POLYGON((-180 -86, 180 -86, 180 86, -180 86, -180 -86))'::GEOMETRY,
+    quadbin_from_tile(0, 0, 1)
+);
+----
+true
