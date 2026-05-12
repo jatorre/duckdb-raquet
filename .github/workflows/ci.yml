@@ -22,43 +22,18 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y cmake ninja-build zlib1g-dev
 
-    - name: Build extension (Release)
-      run: |
-        # actions/checkout@v4 fetches the duckdb submodule shallowly by default,
-        # so `git describe --tags --long` inside duckdb/ fails and DuckDB's
-        # CMakeLists.txt falls back to embedding 'v0.0.1' as the binary's
-        # version. INSTALL <ext> then 404s against extensions.duckdb.org/v0.0.1/...
-        # Set OVERRIDE_GIT_DESCRIBE explicitly. Update the v1.5.2 below when
-        # bumping the duckdb submodule.
-        export OVERRIDE_GIT_DESCRIBE="v1.5.2-0-g$(cd duckdb && git rev-parse --short=10 HEAD)"
-        echo "OVERRIDE_GIT_DESCRIBE=$OVERRIDE_GIT_DESCRIBE"
-        make release
-
-    - name: Run SQL tests
-      run: |
-        make test
-
-    - name: Upload build artifacts
-      if: always()
-      uses: actions/upload-artifact@v4
+    # Mirrors the ccache strategy used by upstream DuckDB's extension CI
+    # template (extension-ci-tools/.github/workflows/_extension_distribution.yml):
+    # restore a per-OS ccache between runs so DuckDB's source tree (which
+    # accounts for the bulk of the compile work) is not rebuilt from scratch
+    # on every PR. DuckDB's CMakeLists auto-detects ccache via find_program,
+    # so having it on PATH at configure time is enough — no extra cmake flags
+    # are required.
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
       with:
-        name: raquet-linux-amd64
-        path: build/release/extension/raquet/raquet.duckdb_extension
-        if-no-files-found: warn
-
-  build-macos:
-    name: Build (macOS)
-    runs-on: macos-latest
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Install dependencies
-      run: |
-        brew install cmake ninja
+        key: ccache-${{ runner.os }}
+        max-size: 1G
 
     - name: Build extension (Release)
       run: |
@@ -75,37 +50,6 @@ jobs:
     - name: Run SQL tests
       run: |
         make test
-
-    - name: Upload build artifacts
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: raquet-macos
-        path: build/release/extension/raquet/raquet.duckdb_extension
-        if-no-files-found: warn
-
-  test-with-sample-data:
-    name: Test with Sample Data
-    runs-on: ubuntu-latest
-    needs: build-linux
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake ninja-build zlib1g-dev curl
-
-    - name: Build extension
-      run: |
-        # See note in build-linux job for why OVERRIDE_GIT_DESCRIBE is needed.
-        export OVERRIDE_GIT_DESCRIBE="v1.5.2-0-g$(cd duckdb && git rev-parse --short=10 HEAD)"
-        echo "OVERRIDE_GIT_DESCRIBE=$OVERRIDE_GIT_DESCRIBE"
-        make release
 
     - name: Test with sample data
       run: |
@@ -149,3 +93,63 @@ jobs:
 
           SELECT 'All tests passed!' as status;
         "
+
+    - name: Upload build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: raquet-linux-amd64
+        path: build/release/extension/raquet/raquet.duckdb_extension
+        if-no-files-found: warn
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        brew install cmake ninja
+
+    # Mirrors the ccache strategy used by upstream DuckDB's extension CI
+    # template (extension-ci-tools/.github/workflows/_extension_distribution.yml):
+    # restore a per-OS ccache between runs so DuckDB's source tree (which
+    # accounts for the bulk of the compile work) is not rebuilt from scratch
+    # on every PR. DuckDB's CMakeLists auto-detects ccache via find_program,
+    # so having it on PATH at configure time is enough — no extra cmake flags
+    # are required.
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{ runner.os }}
+        max-size: 1G
+
+    - name: Build extension (Release)
+      run: |
+        # actions/checkout@v4 fetches the duckdb submodule shallowly by default,
+        # so `git describe --tags --long` inside duckdb/ fails and DuckDB's
+        # CMakeLists.txt falls back to embedding 'v0.0.1' as the binary's
+        # version. INSTALL <ext> then 404s against extensions.duckdb.org/v0.0.1/...
+        # Set OVERRIDE_GIT_DESCRIBE explicitly. Update the v1.5.2 below when
+        # bumping the duckdb submodule.
+        export OVERRIDE_GIT_DESCRIBE="v1.5.2-0-g$(cd duckdb && git rev-parse --short=10 HEAD)"
+        echo "OVERRIDE_GIT_DESCRIBE=$OVERRIDE_GIT_DESCRIBE"
+        make release
+
+    - name: Run SQL tests
+      run: |
+        make test
+
+    - name: Upload build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: raquet-macos
+        path: build/release/extension/raquet/raquet.duckdb_extension
+        if-no-files-found: warn
+
