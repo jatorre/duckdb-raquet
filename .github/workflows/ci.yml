@@ -115,13 +115,13 @@ jobs:
           LOAD 'build/release/extension/raquet/raquet.duckdb_extension';
 
           -- Test basic query
-          SELECT count(*) as total_rows FROM read_parquet('test_data/raquet_test.parquet');
+          SELECT count(*) as total_rows FROM read_parquet('test/data/raquet_test.parquet');
 
           -- Test metadata extraction
           SELECT
             json_extract_string(metadata, '$.compression') as compression,
             json_extract_string(metadata, '$.block_width') as block_width
-          FROM read_parquet('test_data/raquet_test.parquet')
+          FROM read_parquet('test/data/raquet_test.parquet')
           WHERE block = 0;
 
           -- Test QUADBIN functions. DuckDB 1.5.2's parser rejects
@@ -135,7 +135,7 @@ jobs:
             (quadbin_to_bbox(block)).min_lat as min_lat,
             (quadbin_to_bbox(block)).max_lon as max_lon,
             (quadbin_to_bbox(block)).max_lat as max_lat
-          FROM read_parquet('test_data/raquet_test.parquet')
+          FROM read_parquet('test/data/raquet_test.parquet')
           WHERE block != 0
           LIMIT 3;
 
@@ -143,7 +143,7 @@ jobs:
           SELECT
             block,
             raquet_pixel(band_1, 'uint8', 128, 128, 256, 'gzip') as pixel_value
-          FROM read_parquet('test_data/raquet_test.parquet')
+          FROM read_parquet('test/data/raquet_test.parquet')
           WHERE block != 0
           LIMIT 3;
 

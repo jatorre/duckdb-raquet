@@ -1,0 +1,183 @@
+# name: test/sql/polyfill.test
+# description: QUADBIN_POLYFILL(geom, resolution) and (geom, resolution, mode).
+#              Covers the three modes (center/intersects/contains), the
+#              "default == center" relationship, and the two error paths
+#              (resolution out of range, invalid mode).
+#              Uses 'WKT'::GEOMETRY casts (no spatial extension dependency).
+#              The 100°×100° test polygon is sized so CENTER mode catches a
+#              non-empty cell list at zoom 3 (tile centres at ±22.5° lon).
+# group: [raquet]
+
+require raquet
+
+# =============================================================================
+# Sanity: a 100°×100° box at origin returns deterministic cell counts at z=3.
+# At zoom 3 the world is 8×8 tiles, each spanning 45°. Four tile centres
+# (lon=±22.5°, lat≈±21.94°) fall inside the box → CENTER mode = 4 cells.
+# =============================================================================
+
+query I
+SELECT len(QUADBIN_POLYFILL(
+    'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+    3
+));
+----
+4
+
+query I
+SELECT count(*)
+FROM (
+    SELECT unnest(QUADBIN_POLYFILL(
+        'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+        3
+    )) AS cell
+)
+WHERE quadbin_resolution(cell) != 3;
+----
+0
+
+# =============================================================================
+# Default mode == 'center': two-arg and three-arg-with-'center' must agree.
+# =============================================================================
+
+query I
+SELECT QUADBIN_POLYFILL(
+    'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+    3
+) = QUADBIN_POLYFILL(
+    'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+    3,
+    'center'
+);
+----
+true
+
+# Empty-string mode is also treated as 'center' (per ParsePolyfillMode).
+query I
+SELECT QUADBIN_POLYFILL(
+    'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+    3
+) = QUADBIN_POLYFILL(
+    'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+    3,
+    ''
+);
+----
+true
+
+# =============================================================================
+# Mode counts at zoom 3 for the same polygon:
+#   contains = 4 (the four tiles wholly inside the 100°×100° box)
+#   center   = 4 (same tile set — their centres lie inside the box)
+#   intersects = 16 (the 4×4 tile block whose bbox overlaps the box)
+# =============================================================================
+
+query III
+SELECT len(QUADBIN_POLYFILL(
+        'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+        3, 'contains'
+   )),
+   len(QUADBIN_POLYFILL(
+        'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+        3, 'center'
+   )),
+   len(QUADBIN_POLYFILL(
+        'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+        3, 'intersects'
+   ));
+----
+4	4	16
+
+# Mode hierarchy at zoom 5 (finer granularity makes the gap obvious).
+query II
+SELECT
+    len(QUADBIN_POLYFILL(
+        'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+        5, 'contains'
+    )) <= len(QUADBIN_POLYFILL(
+        'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+        5, 'center'
+    )),
+    len(QUADBIN_POLYFILL(
+        'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+        5, 'center'
+    )) <= len(QUADBIN_POLYFILL(
+        'POLYGON((-50 -50, 50 -50, 50 50, -50 50, -50 -50))'::GEOMETRY,
+        5, 'intersects'
+    ));
+----
+true	true
+
+# =============================================================================
+# Polygon at zoom 0 — exactly one tile covers everything if the point is inside.
+# A small polygon at the origin always covers (0,0,0).
+# =============================================================================
+
+query I
+SELECT QUADBIN_POLYFILL(
+    'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'::GEOMETRY,
+    0
+) = [quadbin_from_tile(0, 0, 0)];
+----
+true
+
+# =============================================================================
+# Error: resolution out of [0, 26]
+# =============================================================================
+
+statement error
+SELECT QUADBIN_POLYFILL(
+    'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'::GEOMETRY,
+    -1
+);
+----
+QUADBIN_POLYFILL: Resolution must be between 0 and 26
+
+statement error
+SELECT QUADBIN_POLYFILL(
+    'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'::GEOMETRY,
+    27
+);
+----
+QUADBIN_POLYFILL: Resolution must be between 0 and 26
+
+# Same bound applies on the 3-arg overload.
+statement error
+SELECT QUADBIN_POLYFILL(
+    'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'::GEOMETRY,
+    99,
+    'center'
+);
+----
+QUADBIN_POLYFILL: Resolution must be between 0 and 26
+
+# =============================================================================
+# Error: invalid mode string
+# =============================================================================
+
+statement error
+SELECT QUADBIN_POLYFILL(
+    'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'::GEOMETRY,
+    3,
+    'centre'
+);
+----
+QUADBIN_POLYFILL: Invalid mode 'centre'
+
+statement error
+SELECT QUADBIN_POLYFILL(
+    'POLYGON((-1 -1, 1 -1, 1 1, -1 1, -1 -1))'::GEOMETRY,
+    3,
+    'overlaps'
+);
+----
+QUADBIN_POLYFILL: Invalid mode 'overlaps'
+
+# =============================================================================
+# NULL geometry → NULL result.
+# =============================================================================
+
+query I
+SELECT QUADBIN_POLYFILL(CAST(NULL AS GEOMETRY), 3) IS NULL;
+----
+true

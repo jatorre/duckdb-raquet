@@ -1,0 +1,206 @@
+# name: test/sql/read_raster_params.test
+# description: Coverage for read_raster() named parameters that previously
+#              had no direct test exercise. Each param is paired with either
+#              an observable metadata field (extracted via raquet_parse_metadata)
+#              or an error-path assertion.
+#              Already-covered elsewhere: bands (merge_bands.test),
+#              format / approx (read_raster_metadata.test), max_zoom
+#              (merge_bands.test). This file covers the rest:
+#              compression, band_layout, block_size, min_zoom,
+#              overviews, quality, statistics, zoom_strategy,
+#              resampling, sparsity_probe, sparsity_probe_size.
+# group: [raquet]
+
+require raquet
+
+# `require json` matches the convention used by every other read_raster
+# test in the suite — keeps this file gated on the same environment those
+# tests assume (CI, where the json extension is bundled). The queries
+# themselves do not call json_extract; they read metadata via
+# raquet_parse_metadata.
+require json
+
+# ============================================================================
+# Fixture: test/data/test_palette.tif — 16x16 uint8 single-band palette
+# raster, EPSG:4326, nodata=0. Cheap to convert under any param combination.
+# Pair zoom-touching params with overviews='none' to bound the row count.
+# ============================================================================
+
+# ---------- compression -----------------------------------------------------
+# Explicit gzip lands in the metadata's compression field.
+query I
+SELECT (raquet_parse_metadata(metadata)).compression
+FROM read_raster('test/data/test_palette.tif',
+                  compression='gzip', overviews='none')
+WHERE block = 0
+----
+gzip
+
+# Per-band layout (default) rejects anything other than gzip / none.
+statement error
+SELECT count(*) FROM read_raster('test/data/test_palette.tif',
+                                  compression='bogus', overviews='none')
+----
+requires interleaved band layout
+
+# ---------- band_layout -----------------------------------------------------
+# Interleaved layout surfaces in v0.5.0 metadata.
+query I
+SELECT (raquet_parse_metadata(metadata)).band_layout
+FROM read_raster('test/data/test_palette.tif',
+                  band_layout='interleaved',
+                  compression='gzip',
+                  overviews='none')
+WHERE block = 0
+----
+interleaved
+
+# Per-band layout (default) reports as "sequential".
+query I
+SELECT (raquet_parse_metadata(metadata)).band_layout
+FROM read_raster('test/data/test_palette.tif',
+                  compression='gzip', overviews='none')
+WHERE block = 0
+----
+sequential
+
+# ---------- block_size ------------------------------------------------------
+# 512 is accepted; reflected in tiling.block_{width,height}.
+query II
+SELECT (raquet_parse_metadata(metadata)).block_width,
+       (raquet_parse_metadata(metadata)).block_height
+FROM read_raster('test/data/test_palette.tif',
+                  block_size=512, overviews='none')
+WHERE block = 0
+----
+512	512
+
+# Only 256 / 512 / 1024 are accepted.
+statement error
+SELECT count(*) FROM read_raster('test/data/test_palette.tif', block_size=128)
+----
+block_size must be 256, 512, or 1024
+
+# ---------- min_zoom / overviews -------------------------------------------
+# Explicit min_zoom is honored when overviews are enabled (default).
+query II
+SELECT (raquet_parse_metadata(metadata)).min_zoom,
+       (raquet_parse_metadata(metadata)).max_zoom
+FROM read_raster('test/data/test_palette.tif',
+                  max_zoom=5, min_zoom=3)
+WHERE block = 0
+----
+3	5
+
+# overviews='none' collapses min_zoom to max_zoom regardless of min_zoom.
+query II
+SELECT (raquet_parse_metadata(metadata)).min_zoom,
+       (raquet_parse_metadata(metadata)).max_zoom
+FROM read_raster('test/data/test_palette.tif',
+                  max_zoom=4, min_zoom=2, overviews='none')
+WHERE block = 0
+----
+4	4
+
+# ---------- quality --------------------------------------------------------
+# Only meaningful with jpeg/webp (which may not be compiled in). Verify the
+# parameter parses and surfaces in v0.5.0 metadata.
+query I
+SELECT (raquet_parse_metadata(metadata)).compression_quality
+FROM read_raster('test/data/test_palette.tif',
+                  compression='gzip', quality=80, overviews='none')
+WHERE block = 0
+----
+80
+
+# ---------- statistics -----------------------------------------------------
+# statistics=true publishes tile_statistics=true in metadata.
+query I
+SELECT (raquet_parse_metadata(metadata)).tile_statistics
+FROM read_raster('test/data/test_palette.tif',
+                  statistics=true, overviews='none')
+WHERE block = 0
+----
+true
+
+# Default (statistics=false) reports tile_statistics=false.
+query I
+SELECT (raquet_parse_metadata(metadata)).tile_statistics
+FROM read_raster('test/data/test_palette.tif', overviews='none')
+WHERE block = 0
+----
+false
+
+# ---------- zoom_strategy --------------------------------------------------
+# 'lower' rounds down vs 'upper' rounds up; they may tie on this small
+# fixture but never invert.
+query I
+SELECT
+  (raquet_parse_metadata(z.metadata)).max_zoom <=
+  (raquet_parse_metadata(u.metadata)).max_zoom
+FROM
+  (SELECT metadata FROM read_raster('test/data/test_palette.tif',
+                                     zoom_strategy='lower', overviews='none')
+   WHERE block = 0) z,
+  (SELECT metadata FROM read_raster('test/data/test_palette.tif',
+                                     zoom_strategy='upper', overviews='none')
+   WHERE block = 0) u
+----
+true
+
+statement error
+SELECT count(*) FROM read_raster('test/data/test_palette.tif',
+                                  zoom_strategy='maybe')
+----
+zoom_strategy must be 'auto', 'lower', or 'upper'
+
+# ---------- resampling -----------------------------------------------------
+# Non-default resampling parses and emits at least one data tile.
+query I
+SELECT count(*) > 0
+FROM read_raster('test/data/test_palette.tif',
+                  resampling='bilinear', overviews='none')
+WHERE block != 0
+----
+true
+
+statement error
+SELECT count(*) FROM read_raster('test/data/test_palette.tif',
+                                  resampling='magic')
+----
+Unknown resampling algorithm: 'magic'
+
+# ---------- sparsity_probe -------------------------------------------------
+# All three accepted values bind cleanly.
+statement ok
+SELECT metadata FROM read_raster('test/data/test_palette.tif',
+                                  sparsity_probe='auto', overviews='none')
+WHERE block = 0
+
+statement ok
+SELECT metadata FROM read_raster('test/data/test_palette.tif',
+                                  sparsity_probe='on', overviews='none')
+WHERE block = 0
+
+statement ok
+SELECT metadata FROM read_raster('test/data/test_palette.tif',
+                                  sparsity_probe='off', overviews='none')
+WHERE block = 0
+
+statement error
+SELECT count(*) FROM read_raster('test/data/test_palette.tif',
+                                  sparsity_probe='sometimes')
+----
+sparsity_probe must be 'auto', 'on', or 'off'
+
+# ---------- sparsity_probe_size --------------------------------------------
+statement ok
+SELECT metadata FROM read_raster('test/data/test_palette.tif',
+                                  sparsity_probe_size=8, overviews='none')
+WHERE block = 0
+
+statement error
+SELECT count(*) FROM read_raster('test/data/test_palette.tif',
+                                  sparsity_probe_size=2)
+----
+sparsity_probe_size must be >= 4

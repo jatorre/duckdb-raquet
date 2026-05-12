@@ -1,0 +1,229 @@
+# name: test/sql/metadata_validation.test
+# description: raquet_validate_metadata(json) — covers all error/warning branches
+#              in src/metadata/raquet_metadata.cpp. The function never throws;
+#              every diagnostic is surfaced inside the returned STRUCT (is_valid,
+#              errors, warnings, num_blocks, num_bands, zoom_range).
+# group: [raquet]
+
+require raquet
+
+# =============================================================================
+# Happy path — minimal valid v0.5.0 metadata (nested tiling, file_format set)
+# =============================================================================
+
+query IIII
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "version":"0.5.0",
+  "compression":"gzip",
+  "crs":"EPSG:3857",
+  "band_layout":"sequential",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":5,"block_width":256,"block_height":256,"num_blocks":4},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       len((raquet_validate_metadata('{
+  "file_format":"raquet",
+  "version":"0.5.0",
+  "compression":"gzip",
+  "crs":"EPSG:3857",
+  "band_layout":"sequential",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":5,"block_width":256,"block_height":256,"num_blocks":4},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).errors),
+       (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "version":"0.5.0",
+  "compression":"gzip",
+  "crs":"EPSG:3857",
+  "band_layout":"sequential",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":5,"block_width":256,"block_height":256,"num_blocks":4},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).num_bands,
+       (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "version":"0.5.0",
+  "compression":"gzip",
+  "crs":"EPSG:3857",
+  "band_layout":"sequential",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":5,"block_width":256,"block_height":256,"num_blocks":4},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).zoom_range;
+----
+true	0	1	0-5
+
+# =============================================================================
+# v0 (flat shape) lacks file_format → reports the missing identifier in errors
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{
+  "compression":"gzip",
+  "block_width":256,
+  "block_height":256,
+  "minresolution":0,
+  "maxresolution":5,
+  "bands":[["band_1","uint8"]]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "compression":"gzip",
+  "block_width":256,
+  "block_height":256,
+  "minresolution":0,
+  "maxresolution":5,
+  "bands":[["band_1","uint8"]]
+}')).errors, 'file_format is '''', expected ''raquet''');
+----
+false	true
+
+# =============================================================================
+# Missing bands → "No bands defined in metadata"
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{"file_format":"raquet","tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3}}')).is_valid,
+       list_contains((raquet_validate_metadata('{"file_format":"raquet","tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3}}')).errors, 'No bands defined in metadata');
+----
+false	true
+
+# =============================================================================
+# Unsupported tiling scheme → error
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"slippy","min_zoom":0,"max_zoom":3},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"slippy","min_zoom":0,"max_zoom":3},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).errors, 'Unsupported tiling scheme: slippy');
+----
+false	true
+
+# =============================================================================
+# max_zoom < min_zoom → error
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"quadbin","min_zoom":10,"max_zoom":2},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"quadbin","min_zoom":10,"max_zoom":2},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).errors, 'max_zoom (2) < min_zoom (10)');
+----
+false	true
+
+# =============================================================================
+# max_zoom out of [0, 26] → error
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":99},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":99},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).errors, 'max_zoom out of range [0, 26]: 99');
+----
+false	true
+
+# =============================================================================
+# Unknown band dtype → error
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3},
+  "bands":[{"name":"band_1","type":"bogus_type"}]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3},
+  "bands":[{"name":"band_1","type":"bogus_type"}]
+}')).errors, 'Band ''band_1'' has unknown type: bogus_type');
+----
+false	true
+
+# =============================================================================
+# Unknown compression → warning (not an error)
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "compression":"zstd",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "crs":"EPSG:3857",
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "file_format":"raquet",
+  "compression":"zstd",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "crs":"EPSG:3857",
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).warnings, 'Unknown compression: zstd');
+----
+true	true
+
+# =============================================================================
+# Non-standard CRS → warning
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "compression":"gzip",
+  "crs":"EPSG:4326",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "file_format":"raquet",
+  "compression":"gzip",
+  "crs":"EPSG:4326",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).warnings, 'Non-standard CRS: EPSG:4326 (expected EPSG:3857)');
+----
+true	true
+
+# =============================================================================
+# Non-standard block_width → warning (640 isn't in {256, 512, 1024})
+# =============================================================================
+
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":640,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "file_format":"raquet",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":640,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).warnings, 'Non-standard block_width: 640');
+----
+true	true
+
+# =============================================================================
+# NULL input → NULL struct
+# =============================================================================
+
+query I
+SELECT raquet_validate_metadata(NULL) IS NULL;
+----
+true
