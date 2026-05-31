@@ -58,11 +58,11 @@ SELECT count(*) FROM information_schema.columns WHERE table_name = 'merged_v050'
 ----
 5
 
-# Version preserved from inputs
+# Output carries the current format version (re-serialized via to_json()).
 query I
 SELECT json_extract_string(metadata, '$.version') FROM merged_v050 WHERE block = 0
 ----
-0.5.0
+0.6.0
 
 # Output uses v0.5.0 nested-tiling shape (key test for the parse_metadata
 # round-trip — pre-refactor, the splice approach silently no-op'd on

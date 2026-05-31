@@ -169,6 +169,15 @@ struct ReadRasterBindData : public TableFunctionData {
     std::string overviews = "auto";
     std::string zoom_strategy = "auto"; // auto, lower, upper
     std::string output_format = "v0.5.0"; // v0 or v0.5.0
+    // v0.6.0: target Tile Matrix Set. "WebMercatorQuad" (default, EPSG:3857)
+    // or "GoogleCRS84Quad" (CRS84 plate carrée). Determines warp target SRS,
+    // tile geotransform, zoom calc, and the emitted crs/tile_matrix_set.
+    std::string tile_matrix_set = "WebMercatorQuad";
+
+    // Resolve the parsed string to the TMS strategy (quadbin.hpp).
+    quadbin::TileMatrixSet Tms() const {
+        return quadbin::TileMatrixSet::FromName(tile_matrix_set);
+    }
 
     // Sparsity-aware tile pipeline
     SparsityProbe sparsity_probe = SparsityProbe::Auto;
@@ -377,11 +386,13 @@ struct ReadRasterLocalState : public LocalTableFunctionState {
 // Helper: Enumerate tiles at a given zoom that intersect bounds
 // ─────────────────────────────────────────────
 static std::vector<RasterTile> EnumerateTiles(double minlon, double minlat,
-                                               double maxlon, double maxlat, int zoom) {
+                                               double maxlon, double maxlat, int zoom,
+                                               const quadbin::TileMatrixSet &tms =
+                                                   quadbin::TileMatrixSet{}) {
     std::vector<RasterTile> tiles;
     int min_tx, min_ty, max_tx, max_ty;
-    quadbin::lonlat_to_tile(minlon, maxlat, zoom, min_tx, min_ty); // NW corner
-    quadbin::lonlat_to_tile(maxlon, minlat, zoom, max_tx, max_ty); // SE corner
+    tms.lonlat_to_tile(minlon, maxlat, zoom, min_tx, min_ty); // NW corner
+    tms.lonlat_to_tile(maxlon, minlat, zoom, max_tx, max_ty); // SE corner
 
     for (int ty = min_ty; ty <= max_ty; ty++) {
         for (int tx = min_tx; tx <= max_tx; tx++) {
@@ -396,11 +407,13 @@ static std::vector<RasterTile> EnumerateTiles(double minlon, double minlat,
 // Thread-safe counter for unique /vsimem/ paths
 static std::atomic<uint64_t> vsimem_counter{0};
 
-static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *wkt_3857,
+static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *target_wkt,
                                        const RasterTile &tile, int tile_size,
                                        int band_count, GDALDataType dtype,
                                        double nodata, bool has_nodata,
-                                       std::string &path_out) {
+                                       std::string &path_out,
+                                       const quadbin::TileMatrixSet &tms =
+                                           quadbin::TileMatrixSet{}) {
     // Unique virtual path (atomic counter avoids collisions across threads)
     uint64_t id = vsimem_counter++;
     char path[256];
@@ -412,12 +425,13 @@ static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *wkt_3857,
         throw IOException("Failed to create in-memory tile dataset for %d/%d/%d", tile.z, tile.x, tile.y);
     }
 
-    // Set CRS
-    GDALSetProjection(ds, wkt_3857);
+    // Set CRS (the TMS grid CRS — EPSG:3857 or CRS84)
+    GDALSetProjection(ds, target_wkt);
 
-    // Set geotransform from tile bounds in Web Mercator
+    // Set geotransform from tile bounds in the TMS grid CRS (metres for
+    // WebMercator, degrees for GoogleCRS84Quad)
     double xmin, ymin, xmax, ymax;
-    quadbin::tile_to_bbox_mercator(tile.x, tile.y, tile.z, xmin, ymin, xmax, ymax);
+    tms.tile_to_bbox_projected(tile.x, tile.y, tile.z, xmin, ymin, xmax, ymax);
     double px_width = (xmax - xmin) / tile_size;
     double px_height = (ymax - ymin) / tile_size;
     double gt[6] = {xmin, px_width, 0, ymax, 0, -px_height};
@@ -902,10 +916,14 @@ static double CalculateResolutionFromMercator(GDALDatasetH ds) {
 // ─────────────────────────────────────────────
 // Helper: Calculate zoom from resolution (matches CLI find_zoom)
 // ─────────────────────────────────────────────
-static int CalculateZoom(double resolution, int block_zoom, const std::string &strategy = "auto") {
-    constexpr double CE = 2.0 * quadbin::PI * quadbin::EARTH_RADIUS; // ~40075016.68
+// world_span is the X extent of the world in the target grid CRS units —
+// the equatorial circumference in metres for WebMercatorQuad (default, keeps
+// the legacy result), or 360 degrees for GoogleCRS84Quad. resolution must be
+// in the same units per pixel.
+static int CalculateZoom(double resolution, int block_zoom, const std::string &strategy = "auto",
+                         double world_span = 2.0 * quadbin::PI * quadbin::EARTH_RADIUS) {
     double tile_dim = std::pow(2.0, block_zoom);
-    double raw_zoom = std::log(CE / tile_dim / resolution) / std::log(2.0);
+    double raw_zoom = std::log(world_span / tile_dim / resolution) / std::log(2.0);
     if (strategy == "lower") {
         return static_cast<int>(std::floor(raw_zoom));
     } else if (strategy == "upper") {
@@ -984,13 +1002,14 @@ static void CalculateBoundsFromMercator(GDALDatasetH ds,
 // Matches CLI find_minzoom()
 // ─────────────────────────────────────────────
 static int CalculateMinZoom(double minlon, double minlat, double maxlon, double maxlat,
-                             int max_zoom, int block_zoom) {
+                             int max_zoom, int block_zoom,
+                             const quadbin::TileMatrixSet &tms = quadbin::TileMatrixSet{}) {
     constexpr int TARGET_MIN_SIZE = 128;
     constexpr int BIG_ZOOM = 32;
 
     int ul_x, ul_y, lr_x, lr_y;
-    quadbin::lonlat_to_tile(minlon, maxlat, BIG_ZOOM, ul_x, ul_y);
-    quadbin::lonlat_to_tile(maxlon, minlat, BIG_ZOOM, lr_x, lr_y);
+    tms.lonlat_to_tile(minlon, maxlat, BIG_ZOOM, ul_x, ul_y);
+    tms.lonlat_to_tile(maxlon, minlat, BIG_ZOOM, lr_x, lr_y);
 
     double high_hypot = std::hypot(static_cast<double>(lr_x - ul_x),
                                     static_cast<double>(lr_y - ul_y));
@@ -1049,6 +1068,19 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
             if (bind_data->output_format != "v0" && bind_data->output_format != "v0.5.0") {
                 throw InvalidInputException("format must be 'v0' or 'v0.5.0'");
             }
+        } else if (kv.first == "tile_matrix_set") {
+            // Case-insensitive match → canonical TMS name. Identifiers are
+            // matched loosely (user may pass "googlecrs84quad") but stored
+            // canonically.
+            auto v = StringUtil::Lower(kv.second.GetValue<string>());
+            if (v == "webmercatorquad") {
+                bind_data->tile_matrix_set = "WebMercatorQuad";
+            } else if (v == "googlecrs84quad") {
+                bind_data->tile_matrix_set = "GoogleCRS84Quad";
+            } else {
+                throw InvalidInputException(
+                    "tile_matrix_set must be 'WebMercatorQuad' or 'GoogleCRS84Quad'");
+            }
         } else if (kv.first == "approx") {
             bind_data->approx_stats = kv.second.GetValue<bool>();
         } else if (kv.first == "sparsity_probe") {
@@ -1105,6 +1137,15 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
                 }
             }
         }
+    }
+
+    // The legacy v0.1.0 metadata format predates the tile_matrix_set field and
+    // is hardwired to Web Mercator; refuse to produce a non-Mercator file in it
+    // (it would carry no TMS marker and silently misrender).
+    if (bind_data->tile_matrix_set != "WebMercatorQuad" && bind_data->output_format == "v0") {
+        throw InvalidInputException(
+            "tile_matrix_set '%s' requires format='v0.5.0' (the v0 format cannot "
+            "declare a tile matrix set)", bind_data->tile_matrix_set);
     }
 
     // Initialize embedded PROJ database and GDAL
@@ -1393,6 +1434,11 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         }
     }
 
+    // Capture whether zoom was auto (0) before the CRS branches overwrite it,
+    // so the non-Mercator TMS re-derivation below can honor user-set zooms.
+    bool max_zoom_auto = (bind_data->max_zoom == 0);
+    bool min_zoom_auto = (bind_data->min_zoom == 0);
+
     // Fast path: WGS84 and Web Mercator use pure math (no PROJ database needed)
     if (src_is_wgs84 || bind_data->src_is_web_mercator) {
         double resolution;
@@ -1468,6 +1514,33 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
         GDALClose(ds);
     }
 
+    // GoogleCRS84Quad: zoom is relative to the CRS84 (degree) grid, not the
+    // Mercator metres grid. The branches above computed a Mercator-based zoom;
+    // re-derive against the target grid here. Bounds (WGS84 degrees) are
+    // already populated and are TMS-independent, so only zoom changes.
+    {
+        auto tms = bind_data->Tms();
+        if (tms.id == quadbin::TmsId::GoogleCRS84Quad) {
+            double lon_span = bind_data->bounds_maxlon - bind_data->bounds_minlon;
+            double res_deg = lon_span / std::max(1, bind_data->raster_width);
+            if (max_zoom_auto && res_deg > 0.0) {
+                int z = CalculateZoom(res_deg, bind_data->block_zoom,
+                                      bind_data->zoom_strategy, tms.world_span_x());
+                bind_data->max_zoom = std::max(0, std::min(26, z));
+            }
+            if (bind_data->overviews == "none") {
+                bind_data->min_zoom = bind_data->max_zoom;
+            } else if (min_zoom_auto) {
+                bind_data->min_zoom = CalculateMinZoom(
+                    bind_data->bounds_minlon, bind_data->bounds_minlat,
+                    bind_data->bounds_maxlon, bind_data->bounds_maxlat,
+                    bind_data->max_zoom, bind_data->block_zoom, tms);
+            } else if (bind_data->min_zoom > bind_data->max_zoom) {
+                bind_data->min_zoom = bind_data->max_zoom;
+            }
+        }
+    }
+
     // Define output schema
     // Column 1: block (UBIGINT) — QUADBIN cell ID
     names.push_back("block");
@@ -1508,7 +1581,7 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
     // Estimate tile count for cardinality (enables DuckDB parallelism)
     auto est_tiles = EnumerateTiles(bind_data->bounds_minlon, bind_data->bounds_minlat,
                                      bind_data->bounds_maxlon, bind_data->bounds_maxlat,
-                                     bind_data->max_zoom);
+                                     bind_data->max_zoom, bind_data->Tms());
     bind_data->estimated_tiles = est_tiles.size() + 1; // +1 for metadata row
 
     bind_data->column_names = names;
@@ -1561,7 +1634,7 @@ static unique_ptr<GlobalTableFunctionState> ReadRasterInitGlobal(ClientContext &
     state->native_tiles = EnumerateTiles(
         bind_data.bounds_minlon, bind_data.bounds_minlat,
         bind_data.bounds_maxlon, bind_data.bounds_maxlat,
-        bind_data.max_zoom);
+        bind_data.max_zoom, bind_data.Tms());
 
     // Build overview frames if needed. Each thread will warp its share using
     // its own per-thread GDAL handle (local.src_ds), so no global handle is
@@ -1570,7 +1643,7 @@ static unique_ptr<GlobalTableFunctionState> ReadRasterInitGlobal(ClientContext &
         for (int z = bind_data.min_zoom; z < bind_data.max_zoom; z++) {
             auto tiles_at_zoom = EnumerateTiles(
                 bind_data.bounds_minlon, bind_data.bounds_minlat,
-                bind_data.bounds_maxlon, bind_data.bounds_maxlat, z);
+                bind_data.bounds_maxlon, bind_data.bounds_maxlat, z, bind_data.Tms());
             for (auto &tile : tiles_at_zoom) {
                 OverviewFrame frame;
                 frame.tile = tile;
@@ -1651,8 +1724,16 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             throw IOException("Thread failed to open raster: %s", bind_data.filename);
         }
         local.gtiff_driver = GDALGetDriverByName("GTiff");
+        // Warp-target SRS WKT for this TMS (web_mercator_wkt holds the target
+        // grid CRS — EPSG:3857 for WebMercatorQuad, EPSG:4326/CRS84 for
+        // GoogleCRS84Quad). For the geographic target we force lon/lat axis
+        // order to match the (lon, lat) tile geotransform.
+        auto tms = bind_data.Tms();
         OGRSpatialReferenceH srs = OSRNewSpatialReference(nullptr);
-        OSRImportFromEPSG(srs, 3857);
+        OSRImportFromEPSG(srs, tms.target_epsg());
+        if (tms.target_epsg() == 4326) {
+            OSRSetAxisMappingStrategy(srs, OAMS_TRADITIONAL_GIS_ORDER);
+        }
         OSRExportToWkt(srs, &local.web_mercator_wkt);
         OSRDestroySpatialReference(srs);
         local.initialized = true;
@@ -1698,7 +1779,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             local.gtiff_driver, local.web_mercator_wkt,
             tile, bind_data.block_size,
             static_cast<int>(bind_data.selected_bands.size()), bind_data.gdal_dtype,
-            state.nodata_value, state.has_nodata, tile_path);
+            state.nodata_value, state.has_nodata, tile_path, bind_data.Tms());
 
         // Pre-warp emptiness checks: build the transformer first so both
         // the geometric pre-check and the IO probe can use it. The geometric
@@ -1844,7 +1925,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                 local.gtiff_driver, local.web_mercator_wkt,
                 frame.tile, bind_data.block_size,
                 static_cast<int>(bind_data.selected_bands.size()), bind_data.gdal_dtype,
-                state.nodata_value, state.has_nodata, ovr_path);
+                state.nodata_value, state.has_nodata, ovr_path, bind_data.Tms());
 
             // Decide the source overview level upfront so the pre-warp
             // probe and the warp itself share one transformer. -1 means
@@ -2020,9 +2101,11 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             }
         }
         // Build metadata
+        auto meta_tms = bind_data.Tms();
         raquet::RaquetMetadata meta;
         meta.file_format = "raquet";
-        meta.crs = "EPSG:3857";
+        meta.crs = meta_tms.crs();                  // EPSG:3857 or OGC:CRS84
+        meta.tile_matrix_set = meta_tms.name();     // WebMercatorQuad / GoogleCRS84Quad
         meta.compression = bind_data.compression;
         meta.compression_quality = bind_data.compression_quality;
         meta.band_layout = bind_data.band_layout;
@@ -2160,6 +2243,7 @@ void RegisterReadRaster(ExtensionLoader &loader) {
     func.named_parameters["statistics"] = LogicalType::BOOLEAN;
     func.named_parameters["zoom_strategy"] = LogicalType::VARCHAR;
     func.named_parameters["format"] = LogicalType::VARCHAR;
+    func.named_parameters["tile_matrix_set"] = LogicalType::VARCHAR;
     func.named_parameters["approx"] = LogicalType::BOOLEAN;
     func.named_parameters["sparsity_probe"] = LogicalType::VARCHAR;
     func.named_parameters["sparsity_probe_size"] = LogicalType::INTEGER;

@@ -83,7 +83,13 @@ struct RaquetMetadata {
     int pixel_zoom;     // new in v0.3.0
     int num_blocks;
     std::string scheme; // "quadbin"
-    std::string crs;    // "EPSG:3857"
+    std::string crs;    // "EPSG:3857" (WebMercatorQuad) or "OGC:CRS84" (GoogleCRS84Quad)
+    // v0.6.0: OGC Tile Matrix Set that georeferences the QUADBIN cells.
+    // "WebMercatorQuad" (default / pre-0.6.0 files) or "GoogleCRS84Quad".
+    // The cell bits are identical across TMSs; this field tells consumers how
+    // to map them to geographic coordinates — without it, a non-Mercator file
+    // is silently misread as Web Mercator.
+    std::string tile_matrix_set = "WebMercatorQuad";
     bool tile_statistics;              // v0.5.0: pre-computed per-tile stats
     std::vector<std::string> tile_statistics_columns; // v0.5.0: which stats are available
     std::vector<BandInfo> band_info;  // Full band info including nodata
@@ -388,8 +394,13 @@ struct RaquetMetadata {
     std::string to_json() const {
         std::string json = "{";
         json += "\"file_format\":\"raquet\"";
-        json += ",\"version\":\"0.5.0\"";
+        json += ",\"version\":\"0.6.0\"";
         json += ",\"crs\":\"" + crs + "\"";
+        // v0.6.0: declare the Tile Matrix Set so consumers georeference cells
+        // correctly. Defaults to WebMercatorQuad for parity with pre-0.6.0
+        // (Mercator-only) files.
+        json += ",\"tile_matrix_set\":\"" +
+            (tile_matrix_set.empty() ? std::string("WebMercatorQuad") : tile_matrix_set) + "\"";
 
         // Bounds
         json += ",\"bounds\":[" +
@@ -937,6 +948,11 @@ inline RaquetMetadata parse_metadata(const std::string &json) {
     if (meta.band_layout.empty()) meta.band_layout = "sequential";
 
     meta.crs = extract_json_string(json, "crs");
+
+    // v0.6.0: tile_matrix_set. Absent (≤0.5.0 files) → WebMercatorQuad, so
+    // every legacy Mercator file keeps reading correctly.
+    meta.tile_matrix_set = extract_json_string(json, "tile_matrix_set");
+    if (meta.tile_matrix_set.empty()) meta.tile_matrix_set = "WebMercatorQuad";
 
     // Detect version: v0 has no "version" field, v0.5.0+ has it
     std::string version = extract_json_string(json, "version");

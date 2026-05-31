@@ -180,7 +180,8 @@ SELECT (raquet_validate_metadata('{
 true	true
 
 # =============================================================================
-# Non-standard CRS → warning
+# CRS inconsistent with (defaulted) tile_matrix_set → warning
+# crs=EPSG:4326 with no tile_matrix_set → defaults to WebMercatorQuad (EPSG:3857).
 # =============================================================================
 
 query II
@@ -197,7 +198,7 @@ SELECT (raquet_validate_metadata('{
   "crs":"EPSG:4326",
   "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
   "bands":[{"name":"band_1","type":"uint8"}]
-}')).warnings, 'Non-standard CRS: EPSG:4326 (expected EPSG:3857)');
+}')).warnings, 'CRS EPSG:4326 does not match tile_matrix_set WebMercatorQuad (expected EPSG:3857)');
 ----
 true	true
 
@@ -216,6 +217,50 @@ SELECT (raquet_validate_metadata('{
   "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":640,"block_height":256},
   "bands":[{"name":"band_1","type":"uint8"}]
 }')).warnings, 'Non-standard block_width: 640');
+----
+true	true
+
+# =============================================================================
+# v0.6.0 tile_matrix_set validation
+# =============================================================================
+
+# GoogleCRS84Quad with matching crs (OGC:CRS84) → valid, no warnings.
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet","compression":"gzip","crs":"OGC:CRS84","tile_matrix_set":"GoogleCRS84Quad",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       len((raquet_validate_metadata('{
+  "file_format":"raquet","compression":"gzip","crs":"OGC:CRS84","tile_matrix_set":"GoogleCRS84Quad",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).warnings);
+----
+true	0
+
+# EPSG:4326 accepted as an alias of OGC:CRS84 for GoogleCRS84Quad → no warning.
+query I
+SELECT len((raquet_validate_metadata('{
+  "file_format":"raquet","compression":"gzip","crs":"EPSG:4326","tile_matrix_set":"GoogleCRS84Quad",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).warnings);
+----
+0
+
+# Unknown tile_matrix_set → warning, still structurally valid.
+query II
+SELECT (raquet_validate_metadata('{
+  "file_format":"raquet","compression":"gzip","crs":"EPSG:3857","tile_matrix_set":"BananaQuad",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).is_valid,
+       list_contains((raquet_validate_metadata('{
+  "file_format":"raquet","compression":"gzip","crs":"EPSG:3857","tile_matrix_set":"BananaQuad",
+  "tiling":{"scheme":"quadbin","min_zoom":0,"max_zoom":3,"block_width":256,"block_height":256},
+  "bands":[{"name":"band_1","type":"uint8"}]
+}')).warnings, 'Unknown tile_matrix_set: BananaQuad');
 ----
 true	true
 

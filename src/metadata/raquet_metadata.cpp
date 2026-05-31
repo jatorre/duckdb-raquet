@@ -106,9 +106,25 @@ static void RaquetValidateMetadataFunction(DataChunk &args, ExpressionState &sta
                 warnings.push_back("Unknown band_layout: " + meta.band_layout);
             }
 
-            // Validate CRS
-            if (meta.crs != "EPSG:3857" && !meta.crs.empty()) {
-                warnings.push_back("Non-standard CRS: " + meta.crs + " (expected EPSG:3857)");
+            // Validate tile_matrix_set + CRS consistency (v0.6.0). The CRS the
+            // tile grid is expressed in is determined by the TMS; warn when it
+            // disagrees. Unknown TMS values are flagged but not fatal.
+            std::string expected_crs;
+            if (meta.tile_matrix_set == "WebMercatorQuad") {
+                expected_crs = "EPSG:3857";
+            } else if (meta.tile_matrix_set == "GoogleCRS84Quad") {
+                expected_crs = "OGC:CRS84";
+            } else if (!meta.tile_matrix_set.empty()) {
+                warnings.push_back("Unknown tile_matrix_set: " + meta.tile_matrix_set);
+            }
+            if (!expected_crs.empty() && !meta.crs.empty() && meta.crs != expected_crs) {
+                // Accept EPSG:4326 as an alias of OGC:CRS84 (same lon/lat datum).
+                bool crs84_alias = (expected_crs == "OGC:CRS84" &&
+                                    (meta.crs == "EPSG:4326" || meta.crs == "OGC:CRS84"));
+                if (!crs84_alias) {
+                    warnings.push_back("CRS " + meta.crs + " does not match tile_matrix_set " +
+                                       meta.tile_matrix_set + " (expected " + expected_crs + ")");
+                }
             }
         }
 
