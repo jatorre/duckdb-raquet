@@ -283,6 +283,110 @@ inline void cell_siblings(uint64_t cell, uint64_t siblings[4]) {
     cell_to_children(parent, siblings);
 }
 
+// ─────────────────────────────────────────────
+// Tile Matrix Set abstraction
+//
+// A QUADBIN cell is a pure quadkey (z/x/y packed into 64 bits) — the cell
+// algebra above (tile_to_cell / cell_to_tile / parent / children / kring) is
+// projection-agnostic and shared by every TMS. What differs per TMS is only
+// the mapping between cells and geographic coordinates.
+//
+// The free functions above ARE the WebMercatorQuad mapping; WebMercatorQuad
+// here delegates to them, so its output is byte-identical to the legacy code
+// path (this is the P1 regression guarantee). GoogleCRS84Quad adds a
+// single-root, square-grid, plate-carrée (CRS84) mapping over
+// [-180,180]×[-90,90] — anisotropic pixels, but QUADBIN bit-compatible.
+//
+// Only the producer-side conversions needed by read_raster() are modelled
+// here (lonlat→tile, tile→bbox, world span / max latitude / target SRS).
+// Read-side helpers (lonlat_to_pixel, cell_to_lonlat, …) remain
+// WebMercator-only for now; teaching them about the TMS is consumer-side work.
+// ─────────────────────────────────────────────
+enum class TmsId { WebMercatorQuad, GoogleCRS84Quad };
+
+struct TileMatrixSet {
+    TmsId id = TmsId::WebMercatorQuad;
+
+    // Map a metadata tile_matrix_set string to a TMS. Unknown / empty values
+    // fall back to WebMercatorQuad (back-compat with pre-0.6.0 files).
+    static TileMatrixSet FromName(const std::string &name) {
+        if (name == "GoogleCRS84Quad") return TileMatrixSet{TmsId::GoogleCRS84Quad};
+        return TileMatrixSet{TmsId::WebMercatorQuad};
+    }
+
+    const char *name() const {
+        return id == TmsId::GoogleCRS84Quad ? "GoogleCRS84Quad" : "WebMercatorQuad";
+    }
+    const char *uri() const {
+        return id == TmsId::GoogleCRS84Quad
+            ? "http://www.opengis.net/def/tilematrixset/OGC/1.0/GoogleCRS84Quad"
+            : "http://www.opengis.net/def/tilematrixset/OGC/1.0/WebMercatorQuad";
+    }
+    // CRS the tile grid (cell coordinates / geotransform) is expressed in.
+    const char *crs() const {
+        return id == TmsId::GoogleCRS84Quad ? "OGC:CRS84" : "EPSG:3857";
+    }
+    // EPSG code used to build the GDAL warp-target SRS.
+    int target_epsg() const {
+        return id == TmsId::GoogleCRS84Quad ? 4326 : 3857;
+    }
+    double max_latitude() const {
+        return id == TmsId::GoogleCRS84Quad ? 90.0 : MAX_LATITUDE;
+    }
+    // Span of the world along X in the grid CRS units — metres (full equatorial
+    // circumference) for WebMercator, degrees (360) for CRS84. Drives zoom calc.
+    double world_span_x() const {
+        return id == TmsId::GoogleCRS84Quad ? 360.0 : (2.0 * PI * EARTH_RADIUS);
+    }
+
+    void lonlat_to_tile(double lon, double lat, int z, int &x, int &y) const {
+        if (id == TmsId::WebMercatorQuad) {
+            quadbin::lonlat_to_tile(lon, lat, z, x, y);
+            return;
+        }
+        // GoogleCRS84Quad: plate carrée, single root, square 2^z × 2^z grid.
+        double ml = max_latitude();
+        if (lat > ml) lat = ml;
+        if (lat < -ml) lat = -ml;
+        double n = std::pow(2.0, z);
+        x = static_cast<int>(std::floor((lon + 180.0) / 360.0 * n));
+        y = static_cast<int>(std::floor((90.0 - lat) / 180.0 * n));
+        if (x < 0) x = 0;
+        if (x >= static_cast<int>(n)) x = static_cast<int>(n) - 1;
+        if (y < 0) y = 0;
+        if (y >= static_cast<int>(n)) y = static_cast<int>(n) - 1;
+    }
+
+    // Tile bounds in the grid CRS (metres for WebMercator, degrees for CRS84).
+    // Used to set the warp tile geotransform.
+    void tile_to_bbox_projected(int x, int y, int z,
+                                double &min_x, double &min_y,
+                                double &max_x, double &max_y) const {
+        if (id == TmsId::WebMercatorQuad) {
+            quadbin::tile_to_bbox_mercator(x, y, z, min_x, min_y, max_x, max_y);
+            return;
+        }
+        double n = std::pow(2.0, z);
+        min_x = x / n * 360.0 - 180.0;
+        max_x = (x + 1) / n * 360.0 - 180.0;
+        // Y increases downward in tile space; row 0 is the north edge (+90).
+        max_y = 90.0 - y / n * 180.0;
+        min_y = 90.0 - (y + 1) / n * 180.0;
+    }
+
+    // Tile bounds in WGS84 degrees (metadata bounds, intersection tests).
+    void tile_to_bbox_wgs84(int x, int y, int z,
+                            double &min_lon, double &min_lat,
+                            double &max_lon, double &max_lat) const {
+        if (id == TmsId::WebMercatorQuad) {
+            quadbin::tile_to_bbox_wgs84(x, y, z, min_lon, min_lat, max_lon, max_lat);
+            return;
+        }
+        // CRS84: the projected bbox is already in degrees.
+        tile_to_bbox_projected(x, y, z, min_lon, min_lat, max_lon, max_lat);
+    }
+};
+
 // Calculate pixel coordinates within a tile for a given lon/lat
 inline void lonlat_to_pixel(double lon, double lat, int z, int tile_size,
                             int &pixel_x, int &pixel_y, int &tile_x, int &tile_y) {

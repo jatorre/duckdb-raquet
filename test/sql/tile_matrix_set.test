@@ -1,0 +1,99 @@
+# name: test/sql/tile_matrix_set.test
+# description: read_raster() ingest coverage for the v0.6.0 tile_matrix_set
+#              parameter — WebMercatorQuad (default) vs GoogleCRS84Quad
+#              (WGS84/CRS84): emitted crs/version, value validation, the
+#              v0-format guard, and parquet round-trip of the TMS marker.
+#              Gated on json (like the other read_raster ingest tests) since it
+#              needs the CI GDAL environment; TMS *validation* (no GDAL) lives
+#              in metadata_validation.test.
+# group: [raquet]
+
+require raquet
+
+require parquet
+
+require json
+
+# ============================================================================
+# Fixture: test/data/test_palette.tif — 16x16 uint8 single-band palette
+# raster in EPSG:4326. Being already-WGS84, GoogleCRS84Quad needs no warp.
+# overviews='none' keeps the row count small/deterministic.
+# ============================================================================
+
+# ---------- default → WebMercatorQuad ---------------------------------------
+# No tile_matrix_set param: defaults to WebMercatorQuad / EPSG:3857. Version
+# is bumped to 0.6.0 (the field was added to the schema).
+query III
+SELECT json_extract_string(metadata, '$.tile_matrix_set'),
+       json_extract_string(metadata, '$.crs'),
+       json_extract_string(metadata, '$.version')
+FROM read_raster('test/data/test_palette.tif', overviews='none')
+WHERE block = 0
+----
+WebMercatorQuad	EPSG:3857	0.6.0
+
+# ---------- explicit GoogleCRS84Quad ----------------------------------------
+# crs follows the TMS (OGC:CRS84), tile_matrix_set is declared, version 0.6.0.
+query III
+SELECT json_extract_string(metadata, '$.tile_matrix_set'),
+       json_extract_string(metadata, '$.crs'),
+       json_extract_string(metadata, '$.version')
+FROM read_raster('test/data/test_palette.tif',
+                  tile_matrix_set='GoogleCRS84Quad', overviews='none')
+WHERE block = 0
+----
+GoogleCRS84Quad	OGC:CRS84	0.6.0
+
+# ---------- value is case-insensitive, stored canonically -------------------
+query I
+SELECT json_extract_string(metadata, '$.tile_matrix_set')
+FROM read_raster('test/data/test_palette.tif',
+                  tile_matrix_set='googlecrs84quad', overviews='none')
+WHERE block = 0
+----
+GoogleCRS84Quad
+
+# ---------- produces data tiles (more than just the metadata row) -----------
+query I
+SELECT count(*) > 1
+FROM read_raster('test/data/test_palette.tif',
+                  tile_matrix_set='GoogleCRS84Quad', overviews='none')
+----
+true
+
+# ---------- WebMercatorQuad explicitly == default behavior ------------------
+query II
+SELECT json_extract_string(metadata, '$.tile_matrix_set'),
+       json_extract_string(metadata, '$.crs')
+FROM read_raster('test/data/test_palette.tif',
+                  tile_matrix_set='WebMercatorQuad', overviews='none')
+WHERE block = 0
+----
+WebMercatorQuad	EPSG:3857
+
+# ---------- invalid value rejected ------------------------------------------
+statement error
+SELECT * FROM read_raster('test/data/test_palette.tif', tile_matrix_set='EPSG:4326')
+----
+tile_matrix_set must be
+
+# ---------- GoogleCRS84Quad incompatible with legacy v0 format ---------------
+statement error
+SELECT * FROM read_raster('test/data/test_palette.tif',
+                           tile_matrix_set='GoogleCRS84Quad', format='v0')
+----
+requires format='v0.5.0'
+
+# ---------- parquet round-trip preserves the TMS marker ----------------------
+statement ok
+COPY (SELECT * FROM read_raster('test/data/test_palette.tif',
+                                 tile_matrix_set='GoogleCRS84Quad', overviews='none'))
+TO 'duckdb_unittest_tempdir/tms_crs84.parquet' (FORMAT parquet)
+
+query II
+SELECT json_extract_string(metadata, '$.tile_matrix_set'),
+       json_extract_string(metadata, '$.crs')
+FROM 'duckdb_unittest_tempdir/tms_crs84.parquet'
+WHERE block = 0
+----
+GoogleCRS84Quad	OGC:CRS84

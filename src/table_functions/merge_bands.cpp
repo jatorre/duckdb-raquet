@@ -123,6 +123,8 @@ static raquet::RaquetMetadata BuildMergedMetadata(
         const auto &mi = metas[i];
         if (m0.compression  != mi.compression)  fail_str("compression",  m0.compression,  mi.compression,  i);
         if (m0.crs          != mi.crs)          fail_str("crs",          m0.crs,          mi.crs,          i);
+        if (m0.tile_matrix_set != mi.tile_matrix_set)
+            fail_str("tile_matrix_set", m0.tile_matrix_set, mi.tile_matrix_set, i);
         if (m0.block_width  != mi.block_width)  fail_int("block_width",  m0.block_width,  mi.block_width,  i);
         if (m0.block_height != mi.block_height) fail_int("block_height", m0.block_height, mi.block_height, i);
         if (m0.min_zoom     != mi.min_zoom)     fail_int("min_zoom",     m0.min_zoom,     mi.min_zoom,     i);
