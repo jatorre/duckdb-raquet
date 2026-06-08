@@ -55,6 +55,22 @@ static bool DebugTimingEnabled() {
 }
 
 // ─────────────────────────────────────────────
+// Register GDAL drivers exactly once, process-wide.
+//
+// GDALAllRegister() mutates the global GDALDriverManager (it appends to the
+// driver array and runs AutoLoadDrivers/AutoLoadPythonDrivers) and is NOT
+// thread-safe. Execute() opens a per-thread GDAL handle on each worker's
+// first call, so calling GDALAllRegister() from that path races across all
+// workers and corrupts the heap (observed as SIGTRAP in malloc). std::call_once
+// guarantees a single registration regardless of which phase/thread arrives
+// first (Bind, or the first Execute worker).
+// ─────────────────────────────────────────────
+static void EnsureGDALRegistered() {
+    static std::once_flag gdal_register_once;
+    std::call_once(gdal_register_once, []() { GDALAllRegister(); });
+}
+
+// ─────────────────────────────────────────────
 // GDAL type → raquet BandDataType string mapping
 // ─────────────────────────────────────────────
 static std::string GDALTypeToRaquetType(GDALDataType dt) {
@@ -366,9 +382,19 @@ struct ReadRasterLocalState : public LocalTableFunctionState {
     void *warp_transformer = nullptr;
     int warp_transformer_overview_level = -2;  // sentinel: uninitialized
 
+    // Per-thread cache of source datasets opened at a specific source overview
+    // level via the OVERVIEW_LEVEL open option (the COG fast path). Indexed by
+    // overview level; each entry is lazily opened on first use and reused for
+    // the thread's lifetime. A cached nullptr means "open failed, don't retry".
+    // Base resolution (level -1) uses src_ds, not this cache.
+    std::vector<GDALDatasetH> overview_src_ds;
+
     ~ReadRasterLocalState() {
         if (warp_transformer) GDALDestroyGenImgProjTransformer(warp_transformer);
         if (web_mercator_wkt) CPLFree(web_mercator_wkt);
+        for (GDALDatasetH ds : overview_src_ds) {
+            if (ds) GDALClose(ds);
+        }
         if (src_ds) GDALClose(src_ds);
     }
 };
@@ -436,6 +462,36 @@ static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *wkt_3857,
 }
 
 // ─────────────────────────────────────────────
+// Resolve the source dataset to warp from for a given source overview level.
+//
+// GDAL has no SRC_OVERVIEW_LEVEL transformer option (passing one only emits
+// "Warning 6: ... does not support option" and is ignored). The supported way
+// to read a specific overview is the OVERVIEW_LEVEL open option, which exposes
+// that overview as the dataset's full-resolution bands. We open one such handle
+// per level per thread and cache it, so the warper reads the small overview
+// directly (the COG fast path) instead of re-warping from base resolution.
+//
+// Returns nullptr if the overview cannot be opened; callers fall back to base.
+// ─────────────────────────────────────────────
+static GDALDatasetH GetOverviewSource(ReadRasterLocalState &local,
+                                       const std::string &filename, int level) {
+    if (level >= static_cast<int>(local.overview_src_ds.size())) {
+        local.overview_src_ds.resize(level + 1, nullptr);
+    }
+    if (local.overview_src_ds[level]) {
+        return local.overview_src_ds[level];
+    }
+    char ovr_str[32];
+    snprintf(ovr_str, sizeof(ovr_str), "%d", level);
+    char **oo = CSLSetNameValue(nullptr, "OVERVIEW_LEVEL", ovr_str);
+    GDALDatasetH ds = GDALOpenEx(filename.c_str(), GDAL_OF_RASTER | GDAL_OF_READONLY,
+                                  nullptr, const_cast<const char *const *>(oo), nullptr);
+    CSLDestroy(oo);
+    local.overview_src_ds[level] = ds;  // cache success or failure (nullptr)
+    return ds;
+}
+
+// ─────────────────────────────────────────────
 // Helper: Warp source dataset into tile dataset
 //
 // Uses local.warp_transformer as a per-thread cache so the PROJ pipeline
@@ -444,28 +500,24 @@ static GDALDatasetH CreateTileDataset(GDALDriverH driver, const char *wkt_3857,
 // geotransform is updated via GDALSetGenImgProjTransformerDstGeoTransform
 // and the warp uses the cached object.
 // ─────────────────────────────────────────────
-// Build (or refresh) the per-thread warp transformer for `tile_ds` at the
-// requested source overview level. Same-level reuse just retargets the dst
-// geotransform — cheap. Different overview levels rebuild from scratch.
-// Lifted out of WarpIntoTile so the pre-warp emptiness checks can call it
-// before any warping happens.
+// Build (or refresh) the per-thread warp transformer between `src_ds` and
+// `tile_ds`. The `overview_level` is just the cache key that identifies which
+// source dataset `src_ds` is (the actual overview selection happens upstream
+// via GetOverviewSource). Same-level reuse just retargets the dst geotransform
+// — cheap. Different overview levels rebuild from scratch. Lifted out of
+// WarpIntoTile so the pre-warp emptiness checks can call it before any warping.
 static void EnsureWarpTransformer(ReadRasterLocalState &local,
+                                   GDALDatasetH src_ds,
                                    GDALDatasetH tile_ds,
                                    int overview_level) {
-    GDALDatasetH src_ds = local.src_ds;
     if (!local.warp_transformer || local.warp_transformer_overview_level != overview_level) {
         if (local.warp_transformer) {
             GDALDestroyGenImgProjTransformer(local.warp_transformer);
             local.warp_transformer = nullptr;
         }
-        char **transformer_options = nullptr;
-        if (overview_level >= 0) {
-            char ovr_str[32];
-            snprintf(ovr_str, sizeof(ovr_str), "%d", overview_level);
-            transformer_options = CSLSetNameValue(transformer_options, "SRC_OVERVIEW_LEVEL", ovr_str);
-        }
-        local.warp_transformer = GDALCreateGenImgProjTransformer2(src_ds, tile_ds, transformer_options);
-        CSLDestroy(transformer_options);
+        // No transformer options: overview selection is handled by opening
+        // src_ds at the desired OVERVIEW_LEVEL (see GetOverviewSource).
+        local.warp_transformer = GDALCreateGenImgProjTransformer2(src_ds, tile_ds, nullptr);
         if (!local.warp_transformer) {
             throw IOException("Failed to create image projection transformer");
         }
@@ -477,12 +529,12 @@ static void EnsureWarpTransformer(ReadRasterLocalState &local,
     }
 }
 
-static void WarpIntoTile(ReadRasterLocalState &local, GDALDatasetH tile_ds,
+static void WarpIntoTile(ReadRasterLocalState &local, GDALDatasetH src_ds,
+                          GDALDatasetH tile_ds,
                           GDALResampleAlg resample, double nodata, bool has_nodata,
                           const std::vector<int> &selected_bands,
                           int overview_level = -1) {
-    GDALDatasetH src_ds = local.src_ds;
-    EnsureWarpTransformer(local, tile_ds, overview_level);
+    EnsureWarpTransformer(local, src_ds, tile_ds, overview_level);
 
     GDALWarpOptions *wo = GDALCreateWarpOptions();
     wo->hSrcDS = src_ds;
@@ -1109,7 +1161,7 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
 
     // Initialize embedded PROJ database and GDAL
     raquet::InitEmbeddedProj();
-    GDALAllRegister();
+    EnsureGDALRegistered();
 
     // Open the raster
     GDALDatasetH ds = GDALOpen(bind_data->filename.c_str(), GA_ReadOnly);
@@ -1519,7 +1571,7 @@ static unique_ptr<FunctionData> ReadRasterBind(ClientContext &context,
 // Helper: Open GDAL dataset (with ASSUME_LONGLAT fallback)
 // ─────────────────────────────────────────────
 static GDALDatasetH OpenGDALDataset(const std::string &filename) {
-    GDALAllRegister();
+    EnsureGDALRegistered();
     GDALDatasetH ds = GDALOpen(filename.c_str(), GA_ReadOnly);
     if (!ds) {
         char **open_options = CSLSetNameValue(nullptr, "ASSUME_LONGLAT", "YES");
@@ -1707,7 +1759,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         // time from sparsity_probe + valid_percent stats).
         bool pre_warp_skip = false;
         if (bind_data.sparsity_probe != SparsityProbe::Off) {
-            EnsureWarpTransformer(local, tile_ds, /*overview_level=*/-1);
+            EnsureWarpTransformer(local, local.src_ds, tile_ds, /*overview_level=*/-1);
             pre_warp_skip = IsTileOutsideSource(local.src_ds, local.warp_transformer,
                                                  bind_data.block_size);
             if (!pre_warp_skip && bind_data.sparsity_probe_active) {
@@ -1722,7 +1774,7 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
         }
 
         if (!pre_warp_skip) {
-            WarpIntoTile(local, tile_ds, state.source_resampling,
+            WarpIntoTile(local, local.src_ds, tile_ds, state.source_resampling,
                          state.nodata_value, state.has_nodata,
                          bind_data.selected_bands);
 
@@ -1868,17 +1920,31 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
                 }
             }
 
+            // Resolve the actual source dataset for the chosen overview. The
+            // COG fast path opens a handle at OVERVIEW_LEVEL=chosen_overview so
+            // the warper reads that small overview directly. If the overview
+            // can't be opened, fall back to base resolution.
+            GDALDatasetH ovr_src = local.src_ds;
+            if (chosen_overview >= 0) {
+                GDALDatasetH o = GetOverviewSource(local, bind_data.filename, chosen_overview);
+                if (o) {
+                    ovr_src = o;
+                } else {
+                    chosen_overview = -1;  // open failed → warp from base
+                }
+            }
+
             // Pre-warp emptiness checks (same logic as Phase 1, sharing the
-            // transformer at chosen_overview). The IO probe at sub-resolution
-            // implicitly uses the cheapest GDAL overview anyway.
+            // transformer at chosen_overview). Probes run against ovr_src so
+            // back-projected pixel coords match the transformer's source space.
             bool pre_warp_skip = false;
             if (bind_data.sparsity_probe != SparsityProbe::Off) {
-                EnsureWarpTransformer(local, tile_ds, chosen_overview);
-                pre_warp_skip = IsTileOutsideSource(local.src_ds, local.warp_transformer,
+                EnsureWarpTransformer(local, ovr_src, tile_ds, chosen_overview);
+                pre_warp_skip = IsTileOutsideSource(ovr_src, local.warp_transformer,
                                                      bind_data.block_size);
                 if (!pre_warp_skip && bind_data.sparsity_probe_active) {
                     pre_warp_skip = IsSourceWindowEmpty(
-                        local.src_ds, local.warp_transformer,
+                        ovr_src, local.warp_transformer,
                         bind_data.block_size,
                         bind_data.band_nodatas, bind_data.band_has_nodata,
                         bind_data.band_is_empty,
@@ -1890,18 +1956,19 @@ static void ReadRasterExecute(ClientContext &context, TableFunctionInput &data,
             if (!pre_warp_skip) {
                 if (chosen_overview >= 0) {
                     // COG fast path: read directly from the matching source
-                    // overview. Geometrically valid for any source CRS —
-                    // the destination tile is in Web Mercator regardless,
-                    // and the warper reprojects from the chosen overview
-                    // just as it would from base.
-                    WarpIntoTile(local, tile_ds, GRA_NearestNeighbour,
+                    // overview (ovr_src). Geometrically valid for any source
+                    // CRS — the destination tile is in Web Mercator regardless,
+                    // and the warper reprojects from the chosen overview just
+                    // as it would from base. Nearest-neighbour is appropriate
+                    // because the overview is already at ~the tile resolution.
+                    WarpIntoTile(local, ovr_src, tile_ds, GRA_NearestNeighbour,
                                  state.nodata_value, state.has_nodata,
                                  bind_data.selected_bands, chosen_overview);
                 } else {
                     // Fallback: warp from base resolution. Honour the user's
                     // resampling= named param (default GRA_NearestNeighbour)
                     // so Phase 2 fallback is consistent with Phase 1.
-                    WarpIntoTile(local, tile_ds, state.source_resampling,
+                    WarpIntoTile(local, ovr_src, tile_ds, state.source_resampling,
                                  state.nodata_value, state.has_nodata,
                                  bind_data.selected_bands);
                 }
